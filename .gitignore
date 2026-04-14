@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.claude/
+
+# 데이터/모델 (대용량)
+data/recordings/
+data/tile_cache_osm/
+models/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# 로그
+*.log
+nohup.out
+
+# SQLite 임시파일
+*.db-shm
+*.db-wal
