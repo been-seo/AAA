@@ -23,6 +23,29 @@ from typing import Optional
 
 from .dataset import STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM
 
+# 군용 기지 좌표 (목적지 할당용) — config.py에서 가져올 수 없으므로 직접 정의
+_DEST_COORDS = [
+    (35.1795, 128.9382),  # Gimhae
+    (35.8941, 128.6586),  # Daegu
+    (35.1264, 126.8089),  # Gwangju
+    (36.7220, 127.4987),  # Cheongju
+    (35.0886, 128.0703),  # Sacheon
+    (37.4381, 127.9604),  # Wonju
+    (35.9879, 129.4204),  # Pohang
+    (37.4449, 127.1140),  # Seoul AB
+    (35.9038, 126.6158),  # Gunsan AB
+    (37.0906, 127.0296),  # Osan AB
+    (37.2393, 127.0078),  # Suwon AB
+    (36.9965, 127.8849),  # Jungwon AB
+    (37.7536, 128.9440),  # Gangneung AB
+    (36.6319, 128.3553),  # Yecheon AB
+    (36.7039, 126.4864),  # Seosan AB
+]
+
+# APP 인계 조건
+_APP_HANDOFF_DIST_NM = 30.0
+_APP_HANDOFF_ALT_MIN = 7500.0
+_APP_HANDOFF_ALT_MAX = 12500.0
 
 # ── Symlog Transform (DreamerV3) ──
 # 큰 보상/가치를 압축하여 학습 안정화
@@ -72,57 +95,117 @@ def _build_action_table(device):
 
 # ── 벡터화 보상 함수 (전체 배치를 GPU에서 한번에) ──
 
-def compute_reward_batch(states_raw, actions, device):
+def compute_reward_batch(states_raw, actions, device,
+                         dest_lat=None, dest_lon=None, dest_alt=None,
+                         prev_dist=None, is_arrival=None,
+                         injected=None, prev_in_danger=None):
     """
     배치 전체 보상을 텐서 연산으로 계산.
 
-    states_raw: (B, STATE_DIM) 비정규화 상태
-    actions: (B,) 행동 인덱스
-    return: (B,) 보상
+    보상 철학:
+    - 비행 = 연료 비용 (항상 패널티)
+    - 안전 비행 = 연료비 상쇄
+    - 자기 잘못으로 위험에 빠짐 = 큰 패널티
+    - 돌발 이벤트(inject) 회피 성공 = 보너스
+    - 무사 도달 = 강한 보너스
+
+    injected: (B,) bool — 이번 스텝에 돌발 이벤트가 주입된 항목
+    prev_in_danger: (B,) bool — 이전 스텝에서 위험 상태였던 항목
+    return: (B,) 보상, (B,) 현재 거리, (B,) 현재 위험 상태
     """
     B = states_raw.shape[0]
-    lat = states_raw[:, 0]   # (B,)
+    lat = states_raw[:, 0]
     lon = states_raw[:, 1]
     alt = states_raw[:, 2]
     gs  = states_raw[:, 3]
 
-    rewards = torch.ones(B, device=device)  # 생존 보너스 1.0
+    if injected is None:
+        injected = torch.zeros(B, dtype=torch.bool, device=device)
+    if prev_in_danger is None:
+        prev_in_danger = torch.zeros(B, dtype=torch.bool, device=device)
 
-    # HOLD 보너스
-    rewards += (actions == NUM_ACTIONS - 1).float() * 0.5
-
-    # 분리 위반: 모든 쌍의 거리 계산 (B x B)
-    dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0          # (B, B) NM
-    cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1)          # (B, 1)
-    dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat  # (B, B) NM
-    h_dist = torch.sqrt(dlat**2 + dlon**2)                        # (B, B)
-    v_dist = torch.abs(alt.unsqueeze(1) - alt.unsqueeze(0))       # (B, B)
-
-    # 자기 자신 제외
+    # ── 공통: 분리 계산 ──
+    dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0
+    cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1)
+    dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat
+    h_dist = torch.sqrt(dlat**2 + dlon**2)
+    v_dist = torch.abs(alt.unsqueeze(1) - alt.unsqueeze(0))
     eye_mask = torch.eye(B, device=device, dtype=torch.bool)
     h_dist = h_dist.masked_fill(eye_mask, 1e9)
 
-    # RA급: h<5 & v<1000 → -50
     ra = (h_dist < 5.0) & (v_dist < 1000)
-    rewards -= ra.float().sum(dim=1) * 50
-
-    # TA급: h<10 & v<2000 (RA 제외) → -10
     ta = (h_dist < 10.0) & (v_dist < 2000) & ~ra
-    rewards -= ta.float().sum(dim=1) * 10
+    has_ra = ra.any(dim=1)
+    has_ta = ta.any(dim=1)
+    in_danger = has_ra | has_ta
 
-    # 접근: h<15 (RA/TA 제외) → -2
-    approach = (h_dist < 15.0) & ~ra & ~ta
-    rewards -= approach.float().sum(dim=1) * 2
+    # ══════════════════════════════════
+    #   축 1: SAFETY (안전)
+    # ══════════════════════════════════
+    r_safety = torch.zeros(B, device=device)
+    r_safety += 1.0  # 안전 기본 보너스
 
+    # RA 충돌 = 큰 패널티
+    r_safety -= has_ra.float() * 50
+    # TA 접근 = 중간 패널티
+    r_safety -= has_ta.float() * 10
+    # 자초한 위험 (inject 아닌데 위험)
+    self_caused = in_danger & ~injected
+    r_safety -= self_caused.float() * 30
+    # 돌발 회피 성공
+    evaded = prev_in_danger & injected & ~in_danger
+    r_safety += evaded.float() * 40
+    # 돌발 사전 대응
+    preemptive = injected & ~in_danger & ~prev_in_danger
+    r_safety += preemptive.float() * 10
     # 고도 위반
-    rewards -= (alt < 2000).float() * 30
-    rewards -= ((alt >= 2000) & (alt < 5000)).float() * 5
+    r_safety -= (alt < 2000).float() * 30
+    r_safety -= ((alt >= 2000) & (alt < 5000)).float() * 5
 
+    # ══════════════════════════════════
+    #   축 2: EFFICIENCY (효율)
+    # ══════════════════════════════════
+    r_efficiency = torch.zeros(B, device=device)
+    # 연료 소모 (속도 비례)
+    r_efficiency -= gs / 600.0
     # 속도 이상
-    rewards -= (gs < 150).float() * 20
-    rewards -= (gs > 600).float() * 5
+    r_efficiency -= (gs < 150).float() * 10
+    r_efficiency -= (gs > 600).float() * 5
 
-    return rewards
+    # ══════════════════════════════════
+    #   축 3: MISSION (임무 완수)
+    # ══════════════════════════════════
+    r_mission = torch.zeros(B, device=device)
+
+    # ── 목적지 (mission 축) ──
+    cur_dist = None
+    if dest_lat is not None:
+        d_dlat = (lat - dest_lat) * 60.0
+        d_cos = torch.cos(torch.deg2rad(lat)).clamp(min=0.01)
+        d_dlon = (lon - dest_lon) * 60.0 * d_cos
+        cur_dist = torch.sqrt(d_dlat**2 + d_dlon**2)
+
+        # 멀어지면 mission 패널티, efficiency에도 연료 낭비 반영
+        if prev_dist is not None:
+            regress = (cur_dist - prev_dist).clamp(min=0)
+            r_mission -= regress * 0.5
+            r_efficiency -= regress * 0.2
+
+        # 무사 도달 = mission 대보너스
+        if is_arrival is not None:
+            arr_complete = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM) & \
+                           (alt >= _APP_HANDOFF_ALT_MIN) & (alt <= _APP_HANDOFF_ALT_MAX)
+            r_mission += arr_complete.float() * 100.0
+
+            arr_close = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM)
+            arr_alt_bad = arr_close & ((alt < _APP_HANDOFF_ALT_MIN) | (alt > _APP_HANDOFF_ALT_MAX))
+            r_mission -= arr_alt_bad.float() * 3.0
+
+            dep_complete = ~is_arrival & (cur_dist < 10.0)
+            r_mission += dep_complete.float() * 80.0
+
+    rewards = {'safety': r_safety, 'efficiency': r_efficiency, 'mission': r_mission}
+    return rewards, cur_dist, in_danger
 
 
 # ── Actor (Policy Network) ──
@@ -166,31 +249,34 @@ class Actor(nn.Module):
         return dist.sample()
 
 
-# ── Critic (Value Function = 위험도 평가 엔진) ──
+# ── Multi-Axis Critic (GAN-style 경쟁 학습) ──
+#
+# 3개 축이 각자 Actor를 자기 방향으로 당기며 경쟁:
+#   Safety:     "이 상태가 얼마나 위험한가"
+#   Efficiency: "연료를 얼마나 낭비하는가"
+#   Mission:    "임무 완수에 얼마나 가까운가"
+#
+# Actor는 세 축의 균형점(파레토 최적)을 찾아야 함.
+# 각 Critic의 출력 = 해당 축의 점수 → demo에서 세부 요인 표시에 직접 사용.
 
-class Critic(nn.Module):
-    """
-    상태 → 가치(Value).
-    V(s)가 낮다 = "이 상황은 위험하다" (미래에 큰 negative reward 예상).
-    V(s)가 높다 = "이 상황은 안전하다".
+REWARD_AXES = ['safety', 'efficiency', 'mission']
 
-    학습된 후 Safety Advisor가 이걸 호출해서 위험도를 산출.
-    """
-
-    def __init__(self, state_dim=STATE_DIM, hidden_dim=256):
+class _CriticHead(nn.Module):
+    """단일 축의 Value Function"""
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=192):
         super().__init__()
         self.state_enc = nn.Sequential(
-            nn.Linear(state_dim, 128), nn.ELU(),
-            nn.Linear(128, 128), nn.ELU(),
+            nn.Linear(state_dim, 96), nn.ELU(),
+            nn.Linear(96, 96), nn.ELU(),
         )
         self.traffic_enc = nn.Sequential(
-            nn.Linear(state_dim * 5, 128), nn.ELU(),
-            nn.Linear(128, 64), nn.ELU(),
+            nn.Linear(state_dim * 5, 96), nn.ELU(),
+            nn.Linear(96, 48), nn.ELU(),
         )
         self.value_head = nn.Sequential(
-            nn.Linear(128 + 64, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, 128), nn.ELU(),
-            nn.Linear(128, 1),
+            nn.Linear(96 + 48, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, 96), nn.ELU(),
+            nn.Linear(96, 1),
         )
 
     def forward(self, own_state, traffic_states):
@@ -199,27 +285,57 @@ class Critic(nn.Module):
         t = self.traffic_enc(traffic_states.reshape(B, -1))
         return self.value_head(torch.cat([s, t], dim=-1)).squeeze(-1)
 
+
+class Critic(nn.Module):
+    """
+    3-Axis Critic: safety / efficiency / mission.
+
+    각 head가 해당 축의 Value를 학습하고, Actor 업데이트 시
+    가중합으로 advantage를 계산하되, 가중치가 GAN식으로 경쟁.
+
+    Safety Advisor에서는 각 축의 출력을 직접 위험도/효율/임무 점수로 사용.
+    """
+
+    def __init__(self, state_dim=STATE_DIM):
+        super().__init__()
+        self.safety = _CriticHead(state_dim)
+        self.efficiency = _CriticHead(state_dim)
+        self.mission = _CriticHead(state_dim)
+        self.heads = {'safety': self.safety, 'efficiency': self.efficiency, 'mission': self.mission}
+
+    def forward(self, own_state, traffic_states, axis=None):
+        """axis=None이면 3축 가중합 (기본 가중치), axis 지정 시 해당 축만"""
+        if axis:
+            return self.heads[axis](own_state, traffic_states)
+        # 기본: safety 우선 가중합
+        s = self.safety(own_state, traffic_states)
+        e = self.efficiency(own_state, traffic_states)
+        m = self.mission(own_state, traffic_states)
+        return s * 0.5 + e * 0.2 + m * 0.3
+
+    def forward_all(self, own_state, traffic_states):
+        """3축 모두 반환: dict of (B,) tensors"""
+        return {
+            'safety': self.safety(own_state, traffic_states),
+            'efficiency': self.efficiency(own_state, traffic_states),
+            'mission': self.mission(own_state, traffic_states),
+        }
+
     def risk_score(self, own_state, traffic_states):
-        """
-        Safety Advisor용: V(s) → 위험도 [0, 1].
-        Critic은 symlog space로 학습됨.
-
-        현재 체크포인트(1.3M ep)는 대부분의 상태에 음수 V를 출력하므로,
-        symlog 값을 직접 sigmoid로 변환하되 스케일을 넓게 잡는다.
-        학습이 진행되면 안전 상태의 V가 양수로 올라가면서 자연스럽게 보정됨.
-
-        risk = sigmoid(-V_symlog * 0.5)
-          V_sym=+3  → risk=0.18 (안전)
-          V_sym= 0  → risk=0.50
-          V_sym=-1  → risk=0.62
-          V_sym=-3  → risk=0.82 (주의)
-          V_sym=-5  → risk=0.92 (위험)
-          V_sym=-10 → risk=0.99 (critical)
-        """
+        """Safety Advisor용: safety V → 위험도 [0,1]"""
         with torch.no_grad():
-            v_symlog = self.forward(own_state, traffic_states)
-            risk = torch.sigmoid(-v_symlog * 0.5)
-            return risk.clamp(0, 1)
+            v = self.safety(own_state, traffic_states)
+            return torch.sigmoid(-v * 0.5).clamp(0, 1)
+
+    def axis_scores(self, own_state, traffic_states):
+        """Safety Advisor용: 3축 점수 dict"""
+        with torch.no_grad():
+            vals = self.forward_all(own_state, traffic_states)
+            return {
+                'safety': torch.sigmoid(-vals['safety'] * 0.5).clamp(0, 1),
+                'efficiency': torch.sigmoid(-vals['efficiency'] * 0.5).clamp(0, 1),
+                'mission': torch.sigmoid(-vals['mission'] * 0.5).clamp(0, 1),
+            }
 
 
 # ── 돌발 이벤트 주입 (배치 벡터화) ──
@@ -365,11 +481,30 @@ class DreamerTrainer:
         current_state_raw = self._denormalize(initial_states_norm[:, -1])  # (B, D)
         empty_ctx = torch.zeros(B, MAX_NEIGHBORS, CONTEXT_DIM, device=self.device)
 
+        # ── 목적지 할당 (배치마다 랜덤 기지) ──
+        dest_coords = torch.tensor(_DEST_COORDS, dtype=torch.float32, device=self.device)
+        n_dest = dest_coords.shape[0]
+        dest_idx = torch.randint(0, n_dest, (B,), device=self.device)
+        dest_lat = dest_coords[dest_idx, 0]
+        dest_lon = dest_coords[dest_idx, 1]
+        # 50% arrival, 50% departure
+        is_arrival = torch.rand(B, device=self.device) < 0.5
+        # arrival: 접근 고도, departure: 순항 고도
+        dest_alt = torch.where(is_arrival,
+            torch.tensor(10000.0, device=self.device),
+            torch.tensor(20000.0, device=self.device))
+        # 초기 거리 계산
+        init_dlat = (current_state_raw[:, 0] - dest_lat) * 60.0
+        init_cos = torch.cos(torch.deg2rad(current_state_raw[:, 0])).clamp(min=0.01)
+        init_dlon = (current_state_raw[:, 1] - dest_lon) * 60.0 * init_cos
+        prev_dist = torch.sqrt(init_dlat**2 + init_dlon**2)
+
         # Imagination rollout
         all_states = [current_state_raw]
         all_actions = []
-        all_rewards = []
-        all_values = []
+        all_rewards = {ax: [] for ax in REWARD_AXES}
+        all_values = {ax: [] for ax in REWARD_AXES}
+        prev_in_danger = torch.zeros(B, dtype=torch.bool, device=self.device)
 
         # traffic 인덱스 (배치 내 순환 시프트) — 미리 계산
         shift_indices = torch.stack([
@@ -384,10 +519,11 @@ class DreamerTrainer:
             # 주변 항공기 = 배치 내 다른 항공기 (정규화, 벡터화)
             traffic_norm = own_state_norm[shift_indices]  # (B, 5, D)
 
-            # Critic value
+            # Critic value (축별)
             with torch.no_grad():
-                value = self.target_critic(own_state_norm, traffic_norm)
-            all_values.append(value)
+                vals = self.target_critic.forward_all(own_state_norm, traffic_norm)
+            for ax in REWARD_AXES:
+                all_values[ax].append(vals[ax])
 
             # Actor action
             action = self.actor.get_action(own_state_norm, traffic_norm)
@@ -423,25 +559,33 @@ class DreamerTrainer:
             reward_states = next_state_raw.clone()
             reward_states[inject_mask] = injected[inject_mask]
 
-            # 보상 계산 (GPU 벡터화)
-            rewards = compute_reward_batch(reward_states, action, self.device)
-            all_rewards.append(rewards)
+            # 보상 계산 (GPU 벡터화, 목적지 + 돌발 이벤트 회피)
+            rewards, cur_dist, in_danger = compute_reward_batch(
+                reward_states, action, self.device,
+                dest_lat=dest_lat, dest_lon=dest_lon, dest_alt=dest_alt,
+                prev_dist=prev_dist, is_arrival=is_arrival,
+                injected=inject_mask, prev_in_danger=prev_in_danger)
+            if cur_dist is not None:
+                prev_dist = cur_dist
+            prev_in_danger = in_danger
+            for ax in REWARD_AXES:
+                all_rewards[ax].append(rewards[ax])
 
             current_state_raw = next_state_raw
             all_states.append(current_state_raw)
 
-        # 마지막 스텝 value (bootstrap)
+        # 마지막 스텝 value (bootstrap, 축별)
         own_norm_final = self._normalize(current_state_raw)
         traffic_norm_final = own_norm_final[shift_indices]
         with torch.no_grad():
-            final_value = self.target_critic(own_norm_final, traffic_norm_final)
+            final_vals = self.target_critic.forward_all(own_norm_final, traffic_norm_final)
 
         return {
             'states': torch.stack(all_states, dim=1),      # (B, H+1, D)
             'actions': torch.stack(all_actions, dim=1),     # (B, H)
-            'rewards': torch.stack(all_rewards, dim=1),     # (B, H)
-            'values': torch.stack(all_values, dim=1),       # (B, H)
-            'final_value': final_value,                     # (B,)
+            'rewards': {ax: torch.stack(all_rewards[ax], dim=1) for ax in REWARD_AXES},  # {ax: (B,H)}
+            'values': {ax: torch.stack(all_values[ax], dim=1) for ax in REWARD_AXES},    # {ax: (B,H)}
+            'final_value': final_vals,                      # {ax: (B,)}
         }
 
     def compute_returns(self, rewards, values_symlog, final_value_symlog, lam=0.95):
@@ -470,63 +614,86 @@ class DreamerTrainer:
 
     def train_step(self, initial_states_norm, initial_contexts):
         """
-        한 번의 학습 스텝:
-        1. Imagination rollout
-        2. Critic 업데이트 (returns 학습)
-        3. Actor 업데이트 (value 최대화)
+        3-Axis GAN-style 학습:
+        1. Imagination rollout → 3축 보상
+        2. 각 Critic head 독립 학습 (자기 축의 returns)
+        3. Actor: 3축 advantage 가중합으로 학습
+           가중치는 각 축의 성능(loss)에 반비례 → 못하는 축이 더 강하게 당김
         """
         rollout = self.imagine_rollout(initial_states_norm, initial_contexts)
 
-        returns = self.compute_returns(
-            rollout['rewards'], rollout['values'], rollout['final_value'])
+        # 축별 returns 계산
+        returns_per_axis = {}
+        for ax in REWARD_AXES:
+            returns_per_axis[ax] = self.compute_returns(
+                rollout['rewards'][ax], rollout['values'][ax], rollout['final_value'][ax])
 
-        # ── Critic 업데이트 (symlog space) ──
-        # rollout['states']는 raw space → 정규화 필요
-        states_raw_flat = rollout['states'][:, :-1].reshape(-1, STATE_DIM)  # (B*H, D)
-        states_flat = (states_raw_flat - self.norm_mean) / self.norm_std   # 정규화
-        traffic_flat = torch.zeros(states_flat.shape[0], 5, STATE_DIM,
-                                   device=self.device)
-        returns_flat = returns.reshape(-1)
+        # 공통 준비
+        states_raw_flat = rollout['states'][:, :-1].reshape(-1, STATE_DIM)
+        states_flat = (states_raw_flat - self.norm_mean) / self.norm_std
+        traffic_flat = torch.zeros(states_flat.shape[0], 5, STATE_DIM, device=self.device)
 
-        # returns는 이미 symlog space (compute_returns에서 변환됨)
-        symlog_targets = torch.nan_to_num(returns_flat.detach(), nan=0.0).clamp(-10, 10)
-
-        critic_pred = self.critic(states_flat, traffic_flat)
-        critic_loss = F.mse_loss(critic_pred, symlog_targets)
-
-        # NaN 감지 시 critic 업데이트 스킵
-        if torch.isfinite(critic_loss):
-            self.critic_opt.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-            self.critic_opt.step()
-
-        # ── Actor 업데이트 ──
-        own_states = rollout['states'][:, :-1]  # (B, H, D) raw
+        own_states = rollout['states'][:, :-1]
         B, H, D = own_states.shape
-        own_flat = ((own_states - self.norm_mean) / self.norm_std).reshape(B * H, D)  # 정규화
+        own_flat = ((own_states - self.norm_mean) / self.norm_std).reshape(B * H, D)
         traffic_flat_a = torch.zeros(B * H, 5, STATE_DIM, device=self.device)
 
-        logits = self.actor(own_flat, traffic_flat_a)  # (B*H, A)
-        # NaN 방지: logits 클램프
+        # ── 각 Critic head 독립 학습 ──
+        critic_losses = {}
+        symlog_targets_per_axis = {}
+        for ax in REWARD_AXES:
+            targets = torch.nan_to_num(returns_per_axis[ax].reshape(-1).detach(), nan=0.0).clamp(-10, 10)
+            symlog_targets_per_axis[ax] = targets
+            pred = self.critic.heads[ax](states_flat, traffic_flat)
+            loss = F.mse_loss(pred, targets)
+            critic_losses[ax] = loss.item()
+
+            if torch.isfinite(loss):
+                self.critic_opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+                self.critic_opt.step()
+
+        # ── GAN-style 가중치: 못하는 축이 더 강하게 당김 ──
+        with torch.no_grad():
+            losses = torch.tensor([critic_losses[ax] for ax in REWARD_AXES], device=self.device)
+            losses = losses.clamp(min=0.1)
+            # 높은 loss = 못하는 축 = 더 높은 가중치
+            weights = losses / losses.sum()
+            # safety는 최소 보장 (하한 40%)
+            w_dict = {ax: weights[i].item() for i, ax in enumerate(REWARD_AXES)}
+            if w_dict['safety'] < 0.4:
+                deficit = 0.4 - w_dict['safety']
+                w_dict['safety'] = 0.4
+                # 다른 축에서 비례 감소
+                other_sum = sum(w_dict[a] for a in REWARD_AXES if a != 'safety')
+                if other_sum > 0:
+                    for a in REWARD_AXES:
+                        if a != 'safety':
+                            w_dict[a] -= deficit * (w_dict[a] / other_sum)
+
+        # ── Actor 업데이트: 3축 가중합 advantage ──
+        logits = self.actor(own_flat, traffic_flat_a)
         logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
         dist = torch.distributions.Categorical(logits=logits)
         actions_flat = rollout['actions'].reshape(B * H)
         log_probs = dist.log_prob(actions_flat)
 
-        # Advantage (symlog space에서 비교)
-        with torch.no_grad():
-            values_flat = self.critic(own_flat, traffic_flat_a)
-        advantages = (symlog_targets - values_flat).detach()
-        advantages = torch.nan_to_num(advantages, nan=0.0)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        advantages = advantages.clamp(-5, 5)  # 극단적 advantage 클램프
+        # 축별 advantage 계산 후 가중합
+        total_advantage = torch.zeros(B * H, device=self.device)
+        for ax in REWARD_AXES:
+            with torch.no_grad():
+                v = self.critic.heads[ax](own_flat, traffic_flat_a)
+            adv = (symlog_targets_per_axis[ax] - v).detach()
+            adv = torch.nan_to_num(adv, nan=0.0)
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = adv.clamp(-5, 5)
+            total_advantage += adv * w_dict[ax]
 
-        actor_loss = -(log_probs * advantages).mean()
+        actor_loss = -(log_probs * total_advantage).mean()
         entropy = dist.entropy().mean()
-        actor_loss = actor_loss - 0.03 * entropy  # entropy bonus (강화)
+        actor_loss = actor_loss - 0.03 * entropy
 
-        # NaN 감지 시 actor 업데이트 스킵
         if torch.isfinite(actor_loss):
             self.actor_opt.zero_grad()
             actor_loss.backward()
@@ -534,25 +701,33 @@ class DreamerTrainer:
             self.actor_opt.step()
 
         # Target critic soft update
-        tau = 0.02  # 빠른 추적 (발산 방지)
+        tau = 0.02
         for p, tp in zip(self.critic.parameters(), self.target_critic.parameters()):
             tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
 
         # 통계
-        total_reward = rollout['rewards'].sum(dim=1).mean().item()
-        crashes = (rollout['rewards'] < -30).any(dim=1).sum().item()
-        self.total_episodes += rollout['rewards'].shape[0]
+        safety_r = rollout['rewards']['safety'].sum(dim=1).mean().item()
+        crashes = (rollout['rewards']['safety'] < -30).any(dim=1).sum().item()
+        self.total_episodes += B
         self.total_crashes += crashes
-        self.total_safe += rollout['rewards'].shape[0] - crashes
+        self.total_safe += B - crashes
 
-        # mean_value: symlog space의 평균을 직접 표시 (안정적)
-        mean_v_real = rollout['values'].mean().item()
+        mean_v = {ax: rollout['values'][ax].mean().item() for ax in REWARD_AXES}
 
         return {
             'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item(),
-            'mean_reward': total_reward,
-            'mean_value': mean_v_real,
+            'critic_loss': sum(critic_losses.values()) / 3,
+            'c_safety': critic_losses['safety'],
+            'c_efficiency': critic_losses['efficiency'],
+            'c_mission': critic_losses['mission'],
+            'mean_reward': safety_r,
+            'mean_value': mean_v['safety'],
+            'v_safety': mean_v['safety'],
+            'v_efficiency': mean_v['efficiency'],
+            'v_mission': mean_v['mission'],
+            'w_safety': w_dict['safety'],
+            'w_efficiency': w_dict['efficiency'],
+            'w_mission': w_dict['mission'],
             'crashes': crashes,
             'entropy': entropy.item(),
         }

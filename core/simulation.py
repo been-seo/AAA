@@ -497,6 +497,10 @@ class Simulation:
             self.gui_process.join(timeout=2)
             if self.gui_process.is_alive():
                 self.gui_process.terminate()
+                self.gui_process.join(timeout=2)
+            if self.gui_process.is_alive():
+                self.gui_process.kill()
+                self.gui_process.join(timeout=1)
         if self.parent_conn:
             self.parent_conn.close()
         if self.child_conn:

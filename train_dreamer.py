@@ -189,14 +189,16 @@ def main():
             db.commit()
 
             crash_rate = (trainer.total_crashes / max(trainer.total_episodes, 1)) * 100
+            # 3축 가중치 표시
+            ws = f"w=[S{metrics.get('w_safety',0):.0%}/E{metrics.get('w_efficiency',0):.0%}/M{metrics.get('w_mission',0):.0%}]"
+            vs = f"V=[S{metrics.get('v_safety',0):.1f}/E{metrics.get('v_efficiency',0):.1f}/M{metrics.get('v_mission',0):.1f}]"
             print(f"[{step:6d}] R={metrics['mean_reward']:8.1f} "
-                  f"V={metrics['mean_value']:8.1f} "
+                  f"{vs} "
                   f"crash={metrics['crashes']} "
-                  f"A_loss={metrics['actor_loss']:.4f} "
-                  f"C_loss={metrics['critic_loss']:.4f} "
                   f"ent={metrics['entropy']:.3f} "
-                  f"| total: {trainer.total_episodes}ep "
-                  f"{crash_rate:.1f}%crash")
+                  f"{ws} "
+                  f"| {trainer.total_episodes}ep "
+                  f"{crash_rate:.1f}%")
 
         # WM 리로드 (동시 학습)
         if step % args.wm_reload_interval == 0:

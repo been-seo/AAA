@@ -30,6 +30,7 @@ from enum import IntEnum
 from typing import Optional
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from utils.geo import calculate_distance, calculate_bearing
@@ -97,7 +98,7 @@ class SafetyAdvisor:
     # ACK 불가능 카테고리 — 행동으로만 해소
     NON_ACKABLE = {"AIRSPACE_EXIT", "KADIZ_EXIT", "SQUAWK_EMRG", "MSA", "ATS_ALONG"}
 
-    def __init__(self, world_model_path=None):
+    def __init__(self, world_model_path=None, dreamer_path=None):
         self.alerts: list[SafetyAlert] = []
         self._lock = threading.Lock()
         self._last_scan = 0.0
@@ -113,6 +114,19 @@ class SafetyAdvisor:
         self._wm_scan_interval = 5.0  # World Model은 5초 간격
         if world_model_path:
             self._init_world_model(world_model_path)
+
+        # 시나리오 정보 (연료 경고에서 목적지 거리 계산용)
+        self._scenarios = {}  # callsign -> scenario object
+
+        # Dreamer Critic 기반 AI 위험도 평가 (선택적)
+        self._critic = None
+        self._critic_device = None
+        self._critic_norm_mean = None
+        self._critic_norm_std = None
+        self._critic_last_scan = 0.0
+        self._critic_scan_interval = 3.0
+        if dreamer_path:
+            self._init_critic(dreamer_path)
 
     def _init_world_model(self, model_path):
         """학습된 World Model 로드"""
@@ -138,6 +152,240 @@ class SafetyAdvisor:
             log.warning(f"[SafetyAdvisor] World Model load failed: {e}")
             self._conflict_detector = None
 
+    def _init_critic(self, dreamer_path):
+        """Dreamer Critic (Value Function) 로드 - AI 위험도 평가"""
+        import os
+        if not os.path.exists(dreamer_path):
+            log.warning(f"[SafetyAdvisor] Dreamer checkpoint not found: {dreamer_path}")
+            return
+        try:
+            from ai.world_model.dreamer_policy import Critic
+            from ai.world_model.dataset import STATE_DIM, NORM_MEAN, NORM_STD
+
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            ckpt = torch.load(dreamer_path, map_location=device, weights_only=False)
+            if 'critic' not in ckpt:
+                log.warning("[SafetyAdvisor] No critic in Dreamer checkpoint")
+                return
+            critic = Critic().to(device)
+            critic.load_state_dict(ckpt['critic'])
+            critic.eval()
+
+            self._critic = critic
+            self._critic_device = device
+            self._critic_norm_mean = torch.from_numpy(NORM_MEAN).to(device)
+            self._critic_norm_std = torch.from_numpy(NORM_STD).to(device)
+            ep = ckpt.get('total_episodes', '?')
+            log.info(f"[SafetyAdvisor] Critic loaded ({ep} episodes)")
+        except Exception as e:
+            log.warning(f"[SafetyAdvisor] Critic load failed: {e}")
+            self._critic = None
+
+    def _check_ai_risk(self, user_aircraft, all_aircraft):
+        """
+        user_aircraft에 대해 세부 요인별 위험도를 평가하고 경고를 생성한다.
+
+        요인별 위험도:
+          - separation: 근접 항공기와의 수평/수직 분리 위험
+          - convergence: 수렴 경로 (충돌 코스) 위험
+          - altitude: 고도 관련 위험 (저고도, 급강하/상승)
+          - speed: 속도 이상 위험
+          - overall: Critic Value 기반 종합 위험도
+        """
+        if not self._critic or not user_aircraft:
+            return []
+        from ai.world_model.dataset import STATE_DIM
+
+        device = self._critic_device
+        alerts = []
+
+        ac_list = list(user_aircraft) + [ac for ac in all_aircraft if ac not in user_aircraft]
+        ac_states = {}
+        for ac in ac_list:
+            s = torch.tensor([
+                ac.lat, ac.lon, ac.alt_current,
+                ac.ground_speed_kt, ac.track_true_deg,
+                getattr(ac, 'vertical_rate_ft_min', 0) or 0,
+                getattr(ac, 'ias_kt', 0) or 0,
+                getattr(ac, 'mach', 0) or 0,
+                getattr(ac, 'wind_direction_deg', 0) or 0,
+                getattr(ac, 'wind_speed_kt', 0) or 0,
+            ], dtype=torch.float32, device=device)
+            ac_states[ac] = s
+
+        all_states = torch.stack([ac_states[ac] for ac in ac_list])
+        all_norm = (all_states - self._critic_norm_mean) / self._critic_norm_std
+
+        N = len(ac_list)
+        lat = all_states[:, 0]
+        lon = all_states[:, 1]
+        dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0
+        cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1).clamp(min=0.01)
+        dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat
+        dists_nm = torch.sqrt(dlat**2 + dlon**2)
+        dists_nm.fill_diagonal_(1e9)
+
+        for ui, uac in enumerate(user_aircraft):
+            traffic_norm = torch.zeros(1, 5, STATE_DIM, device=device)
+            k = min(5, N - 1)
+            if k > 0:
+                _, indices = dists_nm[ui].topk(k, largest=False)
+                for j in range(k):
+                    traffic_norm[0, j] = all_norm[indices[j]]
+
+            own_norm = all_norm[ui].unsqueeze(0)
+            with torch.no_grad():
+                overall_risk = self._critic.risk_score(own_norm, traffic_norm).item()
+
+            callsign = getattr(uac, 'callsign', '') or getattr(uac, 'icao24', '?')
+
+            # ── 세부 요인별 위험도 계산 ──
+            factors = {}
+
+            # 1. Separation (분리 위험) — 가장 가까운 항공기 기준
+            sep_risk = 0.0
+            sep_detail = ""
+            if k > 0:
+                nearest_idx = indices[0].item()
+                nearest_ac = ac_list[nearest_idx]
+                nearest_dist = dists_nm[ui, nearest_idx].item()
+                alt_diff = abs(uac.alt_current - nearest_ac.alt_current)
+                nearest_cs = getattr(nearest_ac, 'callsign', '') or getattr(nearest_ac, 'icao24', '?')
+
+                # 수평 분리 위험: 5NM 이내 100%, 10NM 이내 비례
+                if nearest_dist < 5.0:
+                    h_risk = 1.0
+                elif nearest_dist < 15.0:
+                    h_risk = (15.0 - nearest_dist) / 10.0
+                else:
+                    h_risk = 0.0
+                # 수직 분리 위험: 1000ft 이내 100%, 2000ft 이내 비례
+                if alt_diff < 1000:
+                    v_risk = 1.0
+                elif alt_diff < 2000:
+                    v_risk = (2000 - alt_diff) / 1000.0
+                else:
+                    v_risk = 0.0
+
+                sep_risk = min(1.0, h_risk * 0.6 + v_risk * 0.4)
+                sep_detail = f"{nearest_cs} {nearest_dist:.1f}NM/{alt_diff:.0f}ft"
+            factors['separation'] = (sep_risk, sep_detail)
+
+            # 2. Convergence (수렴 위험) — heading alignment
+            conv_risk = 0.0
+            conv_detail = ""
+            if k > 0:
+                nearest_idx = indices[0].item()
+                nearest_ac = ac_list[nearest_idx]
+                nearest_dist = dists_nm[ui, nearest_idx].item()
+                if nearest_dist < 20:
+                    bearing_to = math.degrees(math.atan2(
+                        nearest_ac.lon - uac.lon,
+                        nearest_ac.lat - uac.lat)) % 360
+                    approach_angle = abs((uac.track_true_deg - bearing_to + 180) % 360 - 180)
+                    # heading이 상대방 쪽을 향할수록 위험
+                    if approach_angle < 15:
+                        conv_risk = 1.0
+                    elif approach_angle < 45:
+                        conv_risk = (45 - approach_angle) / 30.0
+                    # 거리 가중
+                    dist_factor = max(0, (20 - nearest_dist) / 20.0)
+                    conv_risk *= dist_factor
+                    nearest_cs = getattr(nearest_ac, 'callsign', '') or getattr(nearest_ac, 'icao24', '?')
+                    if conv_risk > 0.1:
+                        conv_detail = f"{nearest_cs} BRG{bearing_to:.0f} ANGLE{approach_angle:.0f}"
+            factors['convergence'] = (conv_risk, conv_detail)
+
+            # 3. Altitude (고도 위험)
+            alt_risk = 0.0
+            alt_detail = ""
+            alt_val = uac.alt_current
+            vrate = getattr(uac, 'vertical_rate_ft_min', 0) or 0
+            if alt_val < 2000:
+                alt_risk = 1.0
+                alt_detail = f"{alt_val:.0f}ft (위험 저고도)"
+            elif alt_val < 5000:
+                alt_risk = (5000 - alt_val) / 3000.0
+                alt_detail = f"{alt_val:.0f}ft (저고도)"
+            if abs(vrate) > 3000:
+                vr_risk = min(1.0, abs(vrate) / 6000.0)
+                alt_risk = max(alt_risk, vr_risk)
+                alt_detail += f" {'강하' if vrate < 0 else '상승'}{vrate:+.0f}fpm"
+            factors['altitude'] = (alt_risk, alt_detail.strip())
+
+            # 4. Speed (속도 위험)
+            spd_risk = 0.0
+            spd_detail = ""
+            gs = uac.ground_speed_kt
+            if gs < 150:
+                spd_risk = 1.0
+                spd_detail = f"{gs:.0f}kt (실속 위험)"
+            elif gs < 200:
+                spd_risk = (200 - gs) / 50.0
+                spd_detail = f"{gs:.0f}kt (저속)"
+            elif gs > 600:
+                spd_risk = min(1.0, (gs - 600) / 100.0)
+                spd_detail = f"{gs:.0f}kt (초과속도)"
+            factors['speed'] = (spd_risk, spd_detail)
+
+            # 5. Overall (Critic 종합)
+            factors['overall'] = (overall_risk, "AI Value Function")
+
+            # 경고 임계값: 어느 요인이든 75% 이상이면 경고
+            max_factor_risk = max(r for r, _ in factors.values())
+            if max_factor_risk < 0.50:
+                continue
+
+            # 심각도
+            if max_factor_risk >= 0.90:
+                severity = Severity.ALERT
+            elif max_factor_risk >= 0.70:
+                severity = Severity.WARNING
+            else:
+                severity = Severity.CAUTION
+
+            # 메시지: 위험 요인별 확률 나열
+            factor_lines = []
+            recs = []
+            for fname, (frisk, fdetail) in factors.items():
+                if frisk < 0.10:
+                    continue
+                label = {
+                    'separation': 'SEP', 'convergence': 'CONV',
+                    'altitude': 'ALT', 'speed': 'SPD', 'overall': 'AI',
+                }[fname]
+                factor_lines.append(f"{label}:{frisk:.0%}")
+                if fdetail:
+                    factor_lines[-1] += f"({fdetail})"
+                # 요인별 권고
+                if fname == 'separation' and frisk >= 0.5:
+                    recs.append("고도/방향 변경으로 분리 확보")
+                if fname == 'convergence' and frisk >= 0.5:
+                    recs.append("즉시 방향 전환")
+                if fname == 'altitude' and frisk >= 0.5:
+                    recs.append("안전 고도 확보")
+                if fname == 'speed' and frisk >= 0.5:
+                    recs.append("속도 조정")
+
+            msg = f"{callsign}: " + " | ".join(factor_lines)
+            rec = " / ".join(recs) if recs else "상황 주시"
+            if severity >= Severity.ALERT:
+                rec = "[긴급] " + rec
+
+            alerts.append(SafetyAlert(
+                severity=severity,
+                category="AI_RISK",
+                title=f"Risk {max_factor_risk:.0%}",
+                message=msg,
+                aircraft_involved=[callsign],
+                recommendation=rec,
+                position=(uac.lat, uac.lon),
+                event_key=f"AI_RISK_{callsign}",
+                ackable=True,
+            ))
+
+        return alerts
+
     def update(self, user_aircraft, other_aircraft_dict):
         """
         모든 분석을 실행하고 경고 목록을 갱신한다.
@@ -160,6 +408,15 @@ class SafetyAdvisor:
             wm_alerts = self._run_world_model_detection(
                 user_aircraft, other_aircraft_dict)
             new_alerts.extend(wm_alerts)
+
+        # Dreamer Critic AI 위험도 평가 (별도 주기)
+        if self._critic and now - self._critic_last_scan >= self._critic_scan_interval:
+            self._critic_last_scan = now
+            try:
+                ai_alerts = self._check_ai_risk(user_aircraft, all_aircraft)
+                new_alerts.extend(ai_alerts)
+            except Exception as e:
+                log.warning(f"[SafetyAdvisor] AI risk check failed: {e}")
 
         if user_aircraft:
             # 관제 모드: user_aircraft 중심으로 분석
@@ -278,14 +535,39 @@ class SafetyAdvisor:
 
     # ── 1. 충돌 예측 ──
 
+    @staticmethod
+    def _scan_range_nm(speed_kt, minutes, min_nm=10.0):
+        """속도 기반 스캔 범위 (NM). 최소 10NM."""
+        return max(min_nm, speed_kt * minutes / 60.0)
+
+    def _is_moa_aircraft(self, oac):
+        """할당 공역 안에서 기동 중인 항공기인지"""
+        return bool(getattr(oac, 'moa', None))
+
+    def _closing_rate(self, uac, oac, cur_dist):
+        """접근률 (NM/s). 양수=접근, 음수=이격"""
+        u10 = self._extrapolate(uac, 10.0)
+        o10 = self._extrapolate_external(oac, 10.0)
+        d10 = calculate_distance(u10[0], u10[1], o10[0], o10[1])
+        return (cur_dist - d10) / 10.0
+
     def _check_conflicts(self, uac, others):
-        """관제 모드: 우리 전투기(uac) vs 다른 항공기 conflict 체크.
-        민항기끼리는 체크 안 함 — uac는 항상 우리 전투기."""
+        """
+        룰 기반 충돌 탐지 — AI의 보조 안전망.
+
+        - 속도 기반 스캔 범위: max(10, 속도 × 2분) NM
+        - MOA 배정 항공기 제외
+        - 접근률(closing rate) > 0 인 경우만 판단
+        - 민항기 저고도 접근/이륙 패턴 제외
+        """
         alerts = []
         dt = SAFETY_LOOKAHEAD_SEC / SAFETY_LOOKAHEAD_STEPS
 
+        # 속도 기반 스캔 범위 (2분 비행 거리, 최소 10NM)
+        rule_range = self._scan_range_nm(uac.spd_current, 2)
+
         for oac in others:
-            # 민항기 접근/이륙 패턴 필터 (저고도+저속 = 공항 근처 예측 가능)
+            # 민항기 접근/이륙 패턴 필터
             o_alt = getattr(oac, 'alt_current', 0) or 0
             o_spd = getattr(oac, 'ground_speed_kt', 0) or 0
             o_vrate = getattr(oac, 'vertical_rate_ft_min', 0) or 0
@@ -294,25 +576,33 @@ class SafetyAdvisor:
             if o_alt < 5000 and o_vrate < -300:
                 continue
 
-            # 현재 거리가 너무 멀면 스킵 (50NM 이상)
             cur_dist = calculate_distance(uac.lat, uac.lon, oac.lat, oac.lon)
-            if cur_dist > 50:
+
+            # MOA 항공기: 10NM 이상이면 무시, 10NM 이내만 경고
+            if self._is_moa_aircraft(oac) and cur_dist > 10.0:
                 continue
 
+            # 일반 항공기: 속도 기반 거리 필터
+            if not self._is_moa_aircraft(oac) and cur_dist > rule_range:
+                continue
+
+            # 접근률 확인
+            cr = self._closing_rate(uac, oac, cur_dist)
+            if cr <= 0:
+                continue
+
+            # 미래 궤적 외삽
             min_h_dist = cur_dist
             min_v_dist = abs(uac.alt_current - oac.alt_current)
             conflict_time = 0
             conflict_pos = (0, 0)
 
-            # 미래 궤적 외삽
             for step in range(1, SAFETY_LOOKAHEAD_STEPS + 1):
                 t = dt * step
                 u_pos = self._extrapolate(uac, t)
                 o_pos = self._extrapolate_external(oac, t)
-
                 h_dist = calculate_distance(u_pos[0], u_pos[1], o_pos[0], o_pos[1])
                 v_dist = abs(u_pos[2] - o_pos[2])
-
                 if h_dist < min_h_dist:
                     min_h_dist = h_dist
                     min_v_dist = v_dist
@@ -321,39 +611,37 @@ class SafetyAdvisor:
 
             other_cs = getattr(oac, 'callsign', '') or getattr(oac, 'icao24', '?')
 
-            # RA 수준 충돌 예측 (5NM/1000ft 이내)
+            # RA급 (5NM/1000ft)
             if min_h_dist < CONFLICT_HORIZ_NM and min_v_dist < CONFLICT_VERT_FT:
                 sev = Severity.ALERT if conflict_time < 120 else Severity.WARNING
                 brg = calculate_bearing(uac.lat, uac.lon, oac.lat, oac.lon)
-
-                # 회피 방향 계산
                 avoid_hdg, avoid_alt = self._suggest_avoidance(uac, oac, brg)
-
                 alerts.append(SafetyAlert(
                     severity=sev,
                     category="CONFLICT",
-                    title=f"충돌 예측: {other_cs}",
+                    title=f"[RULE] 충돌 예측: {other_cs}",
                     message=(f"{other_cs}과 {conflict_time:.0f}초 후 "
-                             f"수평 {min_h_dist:.1f}NM / 수직 {min_v_dist:.0f}ft 접근 예상. "
-                             f"현재 방위 {brg:.0f}\u00b0, 거리 {cur_dist:.1f}NM"),
+                             f"수평 {min_h_dist:.1f}NM / 수직 {min_v_dist:.0f}ft. "
+                             f"방위 {brg:.0f}, {cur_dist:.1f}NM, "
+                             f"접근률 {cr * 3600:.0f}NM/h"),
                     aircraft_involved=[uac.callsign, other_cs],
                     time_to_event_sec=conflict_time,
-                    recommendation=f"권고: HDG {avoid_hdg:.0f}\u00b0 또는 FL{avoid_alt / 100:.0f}으로 변경",
+                    recommendation=f"권고: HDG {avoid_hdg:.0f} 또는 FL{avoid_alt / 100:.0f}",
                     position=conflict_pos,
                 ))
 
-            # TA 수준 접근 경고 (10NM/2000ft 이내)
+            # TA급 (10NM/2000ft)
             elif min_h_dist < CONFLICT_HORIZ_NM * 2 and min_v_dist < CONFLICT_VERT_FT * 2:
                 if conflict_time < 180:
                     alerts.append(SafetyAlert(
                         severity=Severity.CAUTION,
                         category="CONFLICT",
-                        title=f"접근 주의: {other_cs}",
+                        title=f"[RULE] 접근 주의: {other_cs}",
                         message=(f"{other_cs}과 {conflict_time:.0f}초 후 "
-                                 f"{min_h_dist:.1f}NM/{min_v_dist:.0f}ft 접근 예상"),
+                                 f"{min_h_dist:.1f}NM/{min_v_dist:.0f}ft"),
                         aircraft_involved=[uac.callsign, other_cs],
                         time_to_event_sec=conflict_time,
-                        recommendation="트래픽을 모니터링하세요",
+                        recommendation="트래픽 모니터링",
                         position=conflict_pos,
                     ))
 
@@ -557,6 +845,43 @@ class SafetyAdvisor:
 
     # ── 5. 연료 상태 ──
 
+    def set_scenario(self, callsign, scenario):
+        """시나리오 등록 (연료 경고에서 목적지 거리 계산에 사용)"""
+        self._scenarios[callsign] = scenario
+
+    def _estimate_fuel_to_destination(self, uac):
+        """
+        현재 위치에서 남은 웨이포인트를 순서대로 거쳐 목적지까지
+        필요한 연료(lbs)와 소요시간(분)을 추정.
+        현재 유량 기준 단순 계산.
+        """
+        sc = self._scenarios.get(uac.callsign)
+        if not sc or sc.complete:
+            return None, None, None
+
+        remaining_wps = sc.remaining_waypoints
+        if not remaining_wps:
+            return None, None, None
+
+        total_dist_nm = 0
+        prev_lat, prev_lon = uac.lat, uac.lon
+        for wp_lat, wp_lon, wp_alt, wp_label in remaining_wps:
+            d = calculate_distance(prev_lat, prev_lon, wp_lat, wp_lon)
+            total_dist_nm += d
+            prev_lat, prev_lon = wp_lat, wp_lon
+
+        gs = uac.ground_speed_kt
+        if gs < 50:
+            return total_dist_nm, None, None
+
+        time_min = (total_dist_nm / gs) * 60.0
+        flow = getattr(uac, 'fuel_flow_lbh', 0)
+        if flow < 1:
+            return total_dist_nm, time_min, None
+
+        fuel_needed = flow * (time_min / 60.0)
+        return total_dist_nm, time_min, fuel_needed
+
     def _check_fuel(self, uac):
         alerts = []
         if not hasattr(uac, 'fuel_lbs') or not uac.is_user_controlled:
@@ -565,35 +890,65 @@ class SafetyAdvisor:
         endurance = uac.fuel_endurance_min
         pct = uac.fuel_pct
         flow = getattr(uac, 'fuel_flow_lbh', 0)
+        cs = uac.callsign
+
+        # 목적지 연료 계산 (시나리오 있을 때)
+        dest_dist, dest_time, fuel_needed = self._estimate_fuel_to_destination(uac)
+        has_dest = dest_dist is not None and fuel_needed is not None
 
         if getattr(uac, 'fuel_bingo', False):
+            msg = f"잔여 연료 {uac.fuel_lbs:.0f}lbs ({pct:.0f}%), 체공 {endurance:.0f}분"
+            if has_dest:
+                msg += f". 목적지까지 {dest_dist:.0f}NM/{dest_time:.0f}분, 필요연료 {fuel_needed:.0f}lbs"
             alerts.append(SafetyAlert(
                 severity=Severity.ALERT,
                 category="FUEL",
                 title="BINGO FUEL",
-                message=(f"잔여 연료 {uac.fuel_lbs:.0f}lbs ({pct:.0f}%), "
-                         f"체공 가능 {endurance:.0f}분. 즉시 귀환 필요"),
-                aircraft_involved=[uac.callsign],
+                message=msg + ". 즉시 귀환 필요",
+                aircraft_involved=[cs],
                 recommendation="최단 거리 기지로 즉시 귀환하세요",
             ))
-        elif endurance < 40:
+        elif has_dest and fuel_needed > uac.fuel_lbs * 0.9:
+            # 목적지 도달에 잔여 연료의 90% 이상 필요 → 위험
+            margin_pct = ((uac.fuel_lbs - fuel_needed) / uac.fuel_lbs * 100) if uac.fuel_lbs > 0 else 0
+            if fuel_needed > uac.fuel_lbs:
+                severity = Severity.ALERT
+                title = "연료 부족 - 목적지 도달 불가"
+                rec = "즉시 가까운 기지로 다이버트하세요"
+            else:
+                severity = Severity.WARNING
+                title = "연료 여유 부족"
+                rec = "직항 경로로 전환하거나 불필요한 기동을 줄이세요"
+            alerts.append(SafetyAlert(
+                severity=severity,
+                category="FUEL",
+                title=title,
+                message=(f"잔여 {uac.fuel_lbs:.0f}lbs ({pct:.0f}%) / "
+                         f"목적지까지 {dest_dist:.0f}NM, {dest_time:.0f}분, "
+                         f"필요 {fuel_needed:.0f}lbs (여유 {margin_pct:+.0f}%)"),
+                aircraft_involved=[cs],
+                recommendation=rec,
+            ))
+        elif not has_dest and endurance < 40 and pct < 70:
+            # 시나리오 없을 때만 체공시간 기반 경고 (목적지 있으면 위에서 처리)
             alerts.append(SafetyAlert(
                 severity=Severity.WARNING,
                 category="FUEL",
                 title="연료 부족 경고",
                 message=(f"잔여 연료 {uac.fuel_lbs:.0f}lbs ({pct:.0f}%), "
                          f"유량 {flow:.0f}lbs/hr, 체공 {endurance:.0f}분"),
-                aircraft_involved=[uac.callsign],
+                aircraft_involved=[cs],
                 recommendation="귀환 경로를 확인하고 불필요한 기동을 줄이세요",
             ))
-        elif pct < 50:
+        elif not has_dest and pct < 50:
+            # 시나리오 없을 때만 잔량 비율 경고
             alerts.append(SafetyAlert(
                 severity=Severity.CAUTION,
                 category="FUEL",
                 title="연료 50% 미만",
                 message=(f"잔여 연료 {uac.fuel_lbs:.0f}lbs ({pct:.0f}%), "
                          f"유량 {flow:.0f}lbs/hr, 체공 {endurance:.0f}분"),
-                aircraft_involved=[uac.callsign],
+                aircraft_involved=[cs],
                 recommendation="연료 소모 추이를 모니터링하세요",
             ))
 
@@ -772,7 +1127,20 @@ class SafetyAdvisor:
                     'mach': uac.spd_current / 660.0,
                 })
 
+            # AI 스캔 범위: 속도 × 5분, 최소 10NM
+            user_spd = max((uac.spd_current for uac in user_aircraft), default=400)
+            ai_range = self._scan_range_nm(user_spd, 5)
+
             for icao, ac in other_aircraft_dict.items():
+                nearest_user_dist = min(
+                    (calculate_distance(uac.lat, uac.lon, ac.lat, ac.lon)
+                     for uac in user_aircraft), default=999)
+                # MOA 항공기: 10NM 이상이면 무시
+                if self._is_moa_aircraft(ac) and nearest_user_dist > 10.0:
+                    continue
+                # 일반 항공기: 속도 기반 범위 밖 무시
+                if not self._is_moa_aircraft(ac) and nearest_user_dist > ai_range:
+                    continue
                 self._conflict_detector.update_state(icao, {
                     'lat': ac.lat, 'lon': ac.lon,
                     'baro_altitude_ft': ac.alt_current,

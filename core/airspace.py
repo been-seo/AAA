@@ -364,12 +364,18 @@ class AirspaceManager:
                 self._last_moa_toggle = now
 
         # R구역 토글
+        # R97/R108 (서해 사격장)은 매우 드물게 활성화 (실사격 빈도 반영)
+        _RARE_RZONE_PREFIXES = ("R97", "R108")
         if R_ZONE_LIST and now - self._last_rzone_toggle >= R_ZONE_TOGGLE_INTERVAL_SEC:
             with self._lock:
                 toggle_count = random.randint(1, min(3, len(R_ZONE_LIST)))
                 toggled = random.sample(list(self.rzone_states.keys()), toggle_count)
                 for name in toggled:
                     old = self.rzone_states[name]
+                    # 사격장은 HOT 전환 확률 5% (COLD 전환은 항상 허용)
+                    if not old and name.startswith(_RARE_RZONE_PREFIXES):
+                        if random.random() > 0.005:
+                            continue
                     self.rzone_states[name] = not old
                     print(f"[Airspace] R-zone {name} -> {'HOT' if not old else 'COLD'}")
                     if old and not self.rzone_states[name]:

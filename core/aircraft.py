@@ -91,6 +91,9 @@ class Aircraft:
         self._base_icon_surface = None
         self._icon_size_base = 15
 
+        # 군/민 구분: user_controlled = 군, ADS-B 외부 = 민
+        self.is_military = is_user_controlled
+
         # 연료 (user_controlled 항공기만 시뮬레이션)
         self.fuel_lbs = FUEL_CAPACITY_LBS if is_user_controlled else 0.0
         self.fuel_flow_lbh = 0.0        # 현재 연료유량 (lbs/hr)
@@ -205,6 +208,9 @@ class Aircraft:
         if abs(cos_lat) >= 1e-6:
             self.lon += dist * math.sin(hdg_rad) / (60.0 * cos_lat)
         self.lon = (self.lon + 180) % 360 - 180
+        # ADS-B 호환 필드 동기화
+        self.track_true_deg = self.hdg_current
+        self.ground_speed_kt = self.spd_current
 
     def _update_fuel(self, dt):
         """연료 소모 계산 (고도·속도·기동 함수)"""
