@@ -91,7 +91,7 @@ def main():
     parser.add_argument('--log-db', default='models/dreamer/train_log.db')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--horizon', type=int, default=15)
-    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--total-steps', type=int, default=100000)
     parser.add_argument('--wm-reload-interval', type=int, default=50,
                         help='WM 리로드 체크 주기 (스텝)')
@@ -115,9 +115,10 @@ def main():
         print("[Dreamer] No recording files found!")
         return
 
-    # 학습 데이터 로드
+    # 학습 데이터 로드 + 메모리 프리로드
     dataset = TrajectoryDataset(rec_dir, past_steps=6, future_steps=12, stride=4)
     print(f"[Dreamer] Dataset: {len(dataset)} samples")
+    dataset.preload()
 
     if len(dataset) == 0:
         print("[Dreamer] Empty dataset!")

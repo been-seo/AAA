@@ -195,10 +195,55 @@ class TrajectoryDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx):
+        if getattr(self, '_preloaded', False):
+            return (self._cache_past[idx], self._cache_future[idx],
+                    self._cache_ctx[idx], self._cache_msk[idx],
+                    self._cache_future_raw[idx])
+        return self._load_item(idx)
+
+    def get_norm_params(self):
+        return torch.from_numpy(NORM_MEAN), torch.from_numpy(NORM_STD)
+
+    def preload(self):
+        """
+        전체 데이터셋을 메모리에 프리로드.
+        __getitem__을 모든 인덱스에 대해 호출하여 텐서 캐시를 구축.
+        이후 __getitem__은 DB 쿼리 없이 메모리에서 반환.
+        """
+        import sys
+        N = len(self.index)
+        print(f"[Dataset] Preloading {N} samples into memory...")
+
+        self._cache_past = torch.zeros(N, self.past_steps, STATE_DIM)
+        self._cache_future = torch.zeros(N, self.future_steps, STATE_DIM)
+        self._cache_ctx = torch.zeros(N, self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM)
+        self._cache_msk = torch.zeros(N, self.total_steps, STATE_DIM)
+        self._cache_future_raw = torch.zeros(N, self.future_steps, STATE_DIM)
+
+        for i in range(N):
+            past, future, ctx, msk, future_raw = self._load_item(i)
+            self._cache_past[i] = past
+            self._cache_future[i] = future
+            self._cache_ctx[i] = ctx
+            self._cache_msk[i] = msk
+            self._cache_future_raw[i] = future_raw
+            if (i + 1) % 5000 == 0:
+                mb = (self._cache_past.nbytes + self._cache_future.nbytes +
+                      self._cache_ctx.nbytes + self._cache_msk.nbytes +
+                      self._cache_future_raw.nbytes) / 1024 / 1024
+                print(f"[Dataset] Preloaded {i+1}/{N} ({mb:.0f}MB)")
+
+        self._preloaded = True
+        mb = (self._cache_past.nbytes + self._cache_future.nbytes +
+              self._cache_ctx.nbytes + self._cache_msk.nbytes +
+              self._cache_future_raw.nbytes) / 1024 / 1024
+        print(f"[Dataset] Preload complete: {N} samples, {mb:.0f}MB in RAM")
+
+    def _load_item(self, idx):
+        """DB에서 단일 샘플 로드 (원래 __getitem__ 로직)."""
         db_path, icao, window_sids = self.index[idx]
         conn = self._get_conn(db_path)
 
-        # 해당 윈도우의 상태 벡터 쿼리
         placeholders = ','.join('?' * len(window_sids))
         rows = conn.execute(f"""
             SELECT s.id, a.{', a.'.join(DB_COLUMNS)}
@@ -208,7 +253,6 @@ class TrajectoryDataset(Dataset):
             ORDER BY s.timestamp
         """, [icao] + window_sids).fetchall()
 
-        # 상태 벡터 구축
         states = np.full((self.total_steps, STATE_DIM), np.nan, dtype=np.float32)
         sid_to_idx = {sid: i for i, sid in enumerate(window_sids)}
         for row in rows:
@@ -222,7 +266,6 @@ class TrajectoryDataset(Dataset):
 
         states, mask = _interpolate_nans(states)
 
-        # Context: 같은 snapshot의 다른 항공기
         contexts = np.zeros((self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM),
                             dtype=np.float32)
         for i, sid in enumerate(window_sids):
@@ -235,7 +278,6 @@ class TrajectoryDataset(Dataset):
             """, (sid,)).fetchall()
             contexts[i] = _get_neighbor_context(icao, states[i], ac_rows)
 
-        # 정규화
         norm_states = (states - NORM_MEAN) / NORM_STD
 
         past = torch.from_numpy(norm_states[:self.past_steps].copy())
@@ -245,6 +287,3 @@ class TrajectoryDataset(Dataset):
         future_raw = torch.from_numpy(states[self.past_steps:].copy())
 
         return past, future, ctx, msk, future_raw
-
-    def get_norm_params(self):
-        return torch.from_numpy(NORM_MEAN), torch.from_numpy(NORM_STD)

@@ -1049,7 +1049,11 @@ class SafetyAdvisor:
             return alerts
 
         for route_name, route_data in ATS_ROUTES.items():
-            waypoints = route_data.get('waypoints', [])
+            # route_data: list of [lat, lon, id] or dict with 'waypoints'
+            if isinstance(route_data, list):
+                waypoints = route_data
+            else:
+                waypoints = route_data.get('waypoints', [])
             if len(waypoints) < 2:
                 continue
 
@@ -1060,8 +1064,15 @@ class SafetyAdvisor:
             for i in range(len(waypoints) - 1):
                 wp_a = waypoints[i]
                 wp_b = waypoints[i + 1]
-                a_lat, a_lon = wp_a['lat'], wp_a['lon']
-                b_lat, b_lon = wp_b['lat'], wp_b['lon']
+                # Support both [lat, lon, id] list and {'lat':, 'lon':} dict
+                if isinstance(wp_a, (list, tuple)):
+                    a_lat, a_lon = wp_a[0], wp_a[1]
+                else:
+                    a_lat, a_lon = wp_a['lat'], wp_a['lon']
+                if isinstance(wp_b, (list, tuple)):
+                    b_lat, b_lon = wp_b[0], wp_b[1]
+                else:
+                    b_lat, b_lon = wp_b['lat'], wp_b['lon']
 
                 # 항공기에서 세그먼트까지 대략 거리
                 d_a = calculate_distance(uac.lat, uac.lon, a_lat, a_lon)
