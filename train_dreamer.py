@@ -90,7 +90,7 @@ def main():
     parser.add_argument('--save-dir', default='models/dreamer')
     parser.add_argument('--log-db', default='models/dreamer/train_log.db')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--horizon', type=int, default=15)
+    parser.add_argument('--horizon', type=int, default=16)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--total-steps', type=int, default=100000)
     parser.add_argument('--wm-reload-interval', type=int, default=50,

@@ -95,110 +95,102 @@ def _build_action_table(device):
 
 # ── 벡터화 보상 함수 (전체 배치를 GPU에서 한번에) ──
 
-def compute_reward_batch(states_raw, actions, device,
-                         dest_lat=None, dest_lon=None, dest_alt=None,
-                         prev_dist=None, is_arrival=None,
-                         injected=None, prev_in_danger=None):
+def compute_reward_episode(own_state, traffic_states, action, device,
+                           dest_lat=None, dest_lon=None, dest_alt=None,
+                           prev_dist=None, is_arrival=None,
+                           injected=None, prev_in_danger=None):
     """
-    배치 전체 보상을 텐서 연산으로 계산.
+    에피소드 기반 보상 계산: 내 항공기(own) vs 주변 트래픽(traffic).
 
-    보상 철학:
-    - 비행 = 연료 비용 (항상 패널티)
-    - 안전 비행 = 연료비 상쇄
-    - 자기 잘못으로 위험에 빠짐 = 큰 패널티
-    - 돌발 이벤트(inject) 회피 성공 = 보너스
-    - 무사 도달 = 강한 보너스
-
-    injected: (B,) bool — 이번 스텝에 돌발 이벤트가 주입된 항목
-    prev_in_danger: (B,) bool — 이전 스텝에서 위험 상태였던 항목
-    return: (B,) 보상, (B,) 현재 거리, (B,) 현재 위험 상태
+    own_state: (B, STATE_DIM) 내 항공기 상태
+    traffic_states: (B, N_traffic, STATE_DIM) 주변 트래픽 상태
+    action: (B,) 행동 인덱스
+    injected: (B,) 돌발 이벤트 주입 여부
+    prev_in_danger: (B,) 이전 위험 상태
+    return: rewards dict, cur_dist, in_danger
     """
-    B = states_raw.shape[0]
-    lat = states_raw[:, 0]
-    lon = states_raw[:, 1]
-    alt = states_raw[:, 2]
-    gs  = states_raw[:, 3]
+    B = own_state.shape[0]
+    my_lat = own_state[:, 0]
+    my_lon = own_state[:, 1]
+    my_alt = own_state[:, 2]
+    my_gs  = own_state[:, 3]
 
     if injected is None:
         injected = torch.zeros(B, dtype=torch.bool, device=device)
     if prev_in_danger is None:
         prev_in_danger = torch.zeros(B, dtype=torch.bool, device=device)
 
-    # ── 공통: 분리 계산 ──
-    dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0
-    cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1)
-    dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat
-    h_dist = torch.sqrt(dlat**2 + dlon**2)
-    v_dist = torch.abs(alt.unsqueeze(1) - alt.unsqueeze(0))
-    eye_mask = torch.eye(B, device=device, dtype=torch.bool)
-    h_dist = h_dist.masked_fill(eye_mask, 1e9)
+    N_t = traffic_states.shape[1]
 
-    ra = (h_dist < 5.0) & (v_dist < 1000)
-    ta = (h_dist < 10.0) & (v_dist < 2000) & ~ra
-    has_ra = ra.any(dim=1)
+    # ── 내 항공기 vs 각 트래픽 거리 계산: (B, N_traffic) ──
+    t_lat = traffic_states[:, :, 0]  # (B, N)
+    t_lon = traffic_states[:, :, 1]
+    t_alt = traffic_states[:, :, 2]
+
+    dlat = (my_lat.unsqueeze(1) - t_lat) * 60.0           # (B, N)
+    cos_lat = torch.cos(torch.deg2rad(my_lat)).unsqueeze(1).clamp(min=0.01)
+    dlon = (my_lon.unsqueeze(1) - t_lon) * 60.0 * cos_lat  # (B, N)
+    h_dist = torch.sqrt(dlat**2 + dlon**2)                  # (B, N) NM
+    v_dist = torch.abs(my_alt.unsqueeze(1) - t_alt)         # (B, N) ft
+
+    # 유효 트래픽 마스크 (lat=0, lon=0인 빈 슬롯 제외)
+    valid = (t_lat.abs() > 0.1) & (t_lon.abs() > 0.1)
+    h_dist = h_dist.masked_fill(~valid, 1e9)
+
+    ra = (h_dist < 5.0) & (v_dist < 1000)    # RA급
+    ta = (h_dist < 10.0) & (v_dist < 2000) & ~ra  # TA급
+    has_ra = ra.any(dim=1)   # (B,)
     has_ta = ta.any(dim=1)
     in_danger = has_ra | has_ta
 
     # ══════════════════════════════════
-    #   축 1: SAFETY (안전)
+    #   축 1: SAFETY
     # ══════════════════════════════════
     r_safety = torch.zeros(B, device=device)
-    r_safety += 1.0  # 안전 기본 보너스
-
-    # RA 충돌 = 큰 패널티
-    r_safety -= has_ra.float() * 50
-    # TA 접근 = 중간 패널티
-    r_safety -= has_ta.float() * 10
-    # 자초한 위험 (inject 아닌데 위험)
+    r_safety -= has_ra.float() * 100
+    r_safety -= has_ta.float() * 30
     self_caused = in_danger & ~injected
-    r_safety -= self_caused.float() * 30
-    # 돌발 회피 성공
+    r_safety -= self_caused.float() * 60
     evaded = prev_in_danger & injected & ~in_danger
     r_safety += evaded.float() * 40
-    # 돌발 사전 대응
     preemptive = injected & ~in_danger & ~prev_in_danger
     r_safety += preemptive.float() * 10
-    # 고도 위반
-    r_safety -= (alt < 2000).float() * 30
-    r_safety -= ((alt >= 2000) & (alt < 5000)).float() * 5
+    r_safety -= (my_alt < 2000).float() * 60
+    r_safety -= ((my_alt >= 2000) & (my_alt < 5000)).float() * 15
 
     # ══════════════════════════════════
-    #   축 2: EFFICIENCY (효율)
+    #   축 2: EFFICIENCY
     # ══════════════════════════════════
     r_efficiency = torch.zeros(B, device=device)
-    # 연료 소모 (속도 비례)
-    r_efficiency -= gs / 600.0
-    # 속도 이상
-    r_efficiency -= (gs < 150).float() * 10
-    r_efficiency -= (gs > 600).float() * 5
+    r_efficiency -= my_gs / 600.0
+    r_efficiency -= (my_gs < 150).float() * 10
+    r_efficiency -= (my_gs > 600).float() * 5
 
     # ══════════════════════════════════
-    #   축 3: MISSION (임무 완수)
+    #   축 3: MISSION
     # ══════════════════════════════════
     r_mission = torch.zeros(B, device=device)
 
     # ── 목적지 (mission 축) ──
     cur_dist = None
     if dest_lat is not None:
-        d_dlat = (lat - dest_lat) * 60.0
-        d_cos = torch.cos(torch.deg2rad(lat)).clamp(min=0.01)
-        d_dlon = (lon - dest_lon) * 60.0 * d_cos
+        d_dlat = (my_lat - dest_lat) * 60.0
+        d_cos = torch.cos(torch.deg2rad(my_lat)).clamp(min=0.01)
+        d_dlon = (my_lon - dest_lon) * 60.0 * d_cos
         cur_dist = torch.sqrt(d_dlat**2 + d_dlon**2)
 
-        # 멀어지면 mission 패널티, efficiency에도 연료 낭비 반영
         if prev_dist is not None:
             regress = (cur_dist - prev_dist).clamp(min=0)
             r_mission -= regress * 0.5
             r_efficiency -= regress * 0.2
 
-        # 무사 도달 = mission 대보너스
         if is_arrival is not None:
             arr_complete = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM) & \
-                           (alt >= _APP_HANDOFF_ALT_MIN) & (alt <= _APP_HANDOFF_ALT_MAX)
+                           (my_alt >= _APP_HANDOFF_ALT_MIN) & (my_alt <= _APP_HANDOFF_ALT_MAX)
             r_mission += arr_complete.float() * 100.0
 
             arr_close = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM)
-            arr_alt_bad = arr_close & ((alt < _APP_HANDOFF_ALT_MIN) | (alt > _APP_HANDOFF_ALT_MAX))
+            arr_alt_bad = arr_close & ((my_alt < _APP_HANDOFF_ALT_MIN) | (my_alt > _APP_HANDOFF_ALT_MAX))
             r_mission -= arr_alt_bad.float() * 3.0
 
             dep_complete = ~is_arrival & (cur_dist < 10.0)
@@ -263,20 +255,20 @@ REWARD_AXES = ['safety', 'efficiency', 'mission']
 
 class _CriticHead(nn.Module):
     """단일 축의 Value Function"""
-    def __init__(self, state_dim=STATE_DIM, hidden_dim=192):
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=256):
         super().__init__()
         self.state_enc = nn.Sequential(
-            nn.Linear(state_dim, 96), nn.ELU(),
-            nn.Linear(96, 96), nn.ELU(),
+            nn.Linear(state_dim, 128), nn.ELU(),
+            nn.Linear(128, 128), nn.ELU(),
         )
         self.traffic_enc = nn.Sequential(
-            nn.Linear(state_dim * 5, 96), nn.ELU(),
-            nn.Linear(96, 48), nn.ELU(),
+            nn.Linear(state_dim * 5, 128), nn.ELU(),
+            nn.Linear(128, 64), nn.ELU(),
         )
         self.value_head = nn.Sequential(
-            nn.Linear(96 + 48, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, 96), nn.ELU(),
-            nn.Linear(96, 1),
+            nn.Linear(128 + 64, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, 128), nn.ELU(),
+            nn.Linear(128, 1),
         )
 
     def forward(self, own_state, traffic_states):
@@ -322,17 +314,20 @@ class Critic(nn.Module):
         }
 
     def risk_score(self, own_state, traffic_states):
-        """Safety Advisor용: safety V → 위험도 [0,1]"""
+        """Safety Advisor용: safety V → 위험도 [0,1].
+        safety는 raw space: 0=안전, -100=RA충돌. sigmoid(-V * 0.05)로 변환.
+          V=0 → 0.50, V=-20 → 0.73, V=-50 → 0.92, V=-100 → 0.99
+        """
         with torch.no_grad():
             v = self.safety(own_state, traffic_states)
-            return torch.sigmoid(-v * 0.5).clamp(0, 1)
+            return torch.sigmoid(-v * 0.05).clamp(0, 1)
 
     def axis_scores(self, own_state, traffic_states):
         """Safety Advisor용: 3축 점수 dict"""
         with torch.no_grad():
             vals = self.forward_all(own_state, traffic_states)
             return {
-                'safety': torch.sigmoid(-vals['safety'] * 0.5).clamp(0, 1),
+                'safety': torch.sigmoid(-vals['safety'] * 0.05).clamp(0, 1),
                 'efficiency': torch.sigmoid(-vals['efficiency'] * 0.5).clamp(0, 1),
                 'mission': torch.sigmoid(-vals['mission'] * 0.5).clamp(0, 1),
             }
@@ -407,7 +402,11 @@ class DreamerTrainer:
         self.target_critic.load_state_dict(self.critic.state_dict())
 
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=actor_lr, eps=1e-5)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr, eps=1e-5)
+        # 각 Critic head에 독립 optimizer (gradient 간섭 방지)
+        self.critic_opts = {
+            ax: optim.Adam(self.critic.heads[ax].parameters(), lr=critic_lr, eps=1e-5)
+            for ax in REWARD_AXES
+        }
 
         self.horizon = imagination_horizon
         self.gamma = gamma
@@ -448,19 +447,24 @@ class DreamerTrainer:
 
         return traffic.unsqueeze(0)  # (1, k, STATE_DIM)
 
-    def imagine_rollout(self, initial_states_norm, initial_contexts, batch_size=32):
+    def imagine_rollout(self, initial_states_norm, initial_contexts, traffic_env=None):
         """
-        World Model 안에서 imagination rollout (GPU 벡터화).
+        에피소드 기반 imagination rollout.
 
-        Returns: (states, actions, rewards, values) 시퀀스
+        각 배치 항목 = 1개 에피소드:
+          - initial_states_norm[:, -1] = 내 항공기 초기 상태
+          - traffic_env: (B, H, N_traffic, STATE_DIM) 각 스텝별 주변 트래픽 상태
+            None이면 initial_contexts에서 트래픽을 추출하여 고정 사용
+
+        내 항공기만 Actor가 조종. 트래픽은 환경 데이터대로 움직임.
+        충돌 = 내 항공기 vs 트래픽.
         """
         B, K, D = initial_states_norm.shape
 
-        # 행동 룩업 테이블 (lazy init)
         if not hasattr(self, '_action_table'):
             self._action_table = _build_action_table(self.device)
 
-        # WM warm-up: 과거 시퀀스로 hidden state 초기화
+        # WM warm-up
         h = torch.zeros(self.world_model.gru.num_layers, B, self.world_model.hidden_dim,
                         device=self.device)
         z = torch.zeros(B, self.world_model.latent_dim, device=self.device)
@@ -477,68 +481,119 @@ class DreamerTrainer:
                 post_mean, post_logstd = self.world_model._posterior(h_t, state_emb)
                 z = self.world_model._sample_z(post_mean, post_logstd)
 
-        # 현재 상태 (비정규화)
-        current_state_raw = self._denormalize(initial_states_norm[:, -1])  # (B, D)
-        empty_ctx = torch.zeros(B, MAX_NEIGHBORS, CONTEXT_DIM, device=self.device)
+        # 내 항공기 초기 상태 (비정규화)
+        current_own_raw = self._denormalize(initial_states_norm[:, -1])  # (B, D)
 
-        # ── 목적지 할당 (배치마다 랜덤 기지) ──
+        # 트래픽 환경 구성
+        # traffic_env가 없으면 initial_contexts의 마지막 스텝에서 트래픽 추출하여 고정
+        N_traffic = 5
+        if traffic_env is not None:
+            # (B, H, N_traffic, STATE_DIM) — 스텝별로 다른 트래픽
+            pass
+        else:
+            # context (B, total_steps, MAX_NEIGHBORS, CONTEXT_DIM)에서 트래픽 상태 추정
+            # context는 상대 좌표이므로, 절대 좌표로 복원
+            # 간단히: 내 위치 + context 상대좌표 → 트래픽 절대 좌표
+            last_ctx = initial_contexts[:, -1]  # (B, MAX_NEIGHBORS, CONTEXT_DIM)
+            # CONTEXT_DIM = [dx_nm, dy_nm, dalt_kft, dgs_100, dtrack_180, dvrate_1000]
+            my_lat = current_own_raw[:, 0]  # (B,)
+            my_lon = current_own_raw[:, 1]
+            my_alt = current_own_raw[:, 2]
+            my_gs  = current_own_raw[:, 3]
+            my_trk = current_own_raw[:, 4]
+
+            cos_lat = torch.cos(torch.deg2rad(my_lat)).clamp(min=0.01)
+            t_lat = my_lat.unsqueeze(1) + last_ctx[:, :N_traffic, 1] / 60.0   # dy_nm → lat
+            t_lon = my_lon.unsqueeze(1) + last_ctx[:, :N_traffic, 0] / (60.0 * cos_lat.unsqueeze(1))  # dx_nm → lon
+            t_alt = my_alt.unsqueeze(1) + last_ctx[:, :N_traffic, 2] * 1000.0  # dalt_kft → ft
+            t_gs  = my_gs.unsqueeze(1) + last_ctx[:, :N_traffic, 3] * 100.0    # dgs_100
+            t_trk = my_trk.unsqueeze(1) + last_ctx[:, :N_traffic, 4] * 180.0   # dtrack_180
+            t_vr  = last_ctx[:, :N_traffic, 5] * 1000.0
+
+            # 안전 거리 필터: 15NM 미만 트래픽 제거 (안전한 상태에서 시작)
+            init_dlat_t = (my_lat.unsqueeze(1) - t_lat) * 60.0
+            init_dlon_t = (my_lon.unsqueeze(1) - t_lon) * 60.0 * cos_lat.unsqueeze(1)
+            init_dist_t = torch.sqrt(init_dlat_t**2 + init_dlon_t**2)  # (B, N_traffic)
+            too_close = init_dist_t < 15.0  # 15NM 미만은 제거
+            t_lat = t_lat.masked_fill(too_close, 0.0)
+            t_lon = t_lon.masked_fill(too_close, 0.0)
+            t_alt = t_alt.masked_fill(too_close, 0.0)
+            t_gs  = t_gs.masked_fill(too_close, 0.0)
+            t_trk = t_trk.masked_fill(too_close, 0.0)
+            t_vr  = t_vr.masked_fill(too_close, 0.0)
+
+            # (B, N_traffic, STATE_DIM) 트래픽 상태 텐서
+            zeros = torch.zeros(B, N_traffic, device=self.device)
+            static_traffic = torch.stack([
+                t_lat, t_lon, t_alt, t_gs, t_trk % 360, t_vr,
+                t_gs - 30,  # IAS 근사
+                torch.full_like(zeros, 0.75),  # mach 근사
+                zeros, zeros  # wind
+            ], dim=-1)  # (B, N_traffic, STATE_DIM)
+
+            # 매 스텝 트래픽 = 직선 외삽 (10초 간격)
+            traffic_env = torch.zeros(B, self.horizon, N_traffic, STATE_DIM, device=self.device)
+            for step in range(self.horizon):
+                dt = (step + 1) * 10.0  # 초
+                moved = static_traffic.clone()
+                spd_nm_s = moved[:, :, 3] * 0.000514444 * 1.852 / 1000  # kt → NM/s 근사
+                hdg_rad = torch.deg2rad(moved[:, :, 4])
+                moved[:, :, 0] += spd_nm_s * dt * torch.cos(hdg_rad) / 60.0
+                c_lat = torch.cos(torch.deg2rad(moved[:, :, 0])).clamp(min=0.01)
+                moved[:, :, 1] += spd_nm_s * dt * torch.sin(hdg_rad) / (60.0 * c_lat)
+                moved[:, :, 2] += moved[:, :, 5] / 60.0 * dt  # vrate
+                traffic_env[:, step] = moved
+
+        # ── 목적지 할당 ──
         dest_coords = torch.tensor(_DEST_COORDS, dtype=torch.float32, device=self.device)
         n_dest = dest_coords.shape[0]
         dest_idx = torch.randint(0, n_dest, (B,), device=self.device)
         dest_lat = dest_coords[dest_idx, 0]
         dest_lon = dest_coords[dest_idx, 1]
-        # 50% arrival, 50% departure
         is_arrival = torch.rand(B, device=self.device) < 0.5
-        # arrival: 접근 고도, departure: 순항 고도
         dest_alt = torch.where(is_arrival,
             torch.tensor(10000.0, device=self.device),
             torch.tensor(20000.0, device=self.device))
-        # 초기 거리 계산
-        init_dlat = (current_state_raw[:, 0] - dest_lat) * 60.0
-        init_cos = torch.cos(torch.deg2rad(current_state_raw[:, 0])).clamp(min=0.01)
-        init_dlon = (current_state_raw[:, 1] - dest_lon) * 60.0 * init_cos
+        init_dlat = (current_own_raw[:, 0] - dest_lat) * 60.0
+        init_cos = torch.cos(torch.deg2rad(current_own_raw[:, 0])).clamp(min=0.01)
+        init_dlon = (current_own_raw[:, 1] - dest_lon) * 60.0 * init_cos
         prev_dist = torch.sqrt(init_dlat**2 + init_dlon**2)
 
         # Imagination rollout
-        all_states = [current_state_raw]
+        all_states = [current_own_raw]
         all_actions = []
         all_rewards = {ax: [] for ax in REWARD_AXES}
         all_values = {ax: [] for ax in REWARD_AXES}
         prev_in_danger = torch.zeros(B, dtype=torch.bool, device=self.device)
 
-        # traffic 인덱스 (배치 내 순환 시프트) — 미리 계산
-        shift_indices = torch.stack([
-            (torch.arange(B, device=self.device) + i + 1) % B
-            for i in range(min(B - 1, 5))
-        ], dim=1)  # (B, 5)
+        empty_ctx = torch.zeros(B, MAX_NEIGHBORS, CONTEXT_DIM, device=self.device)
 
         for step in range(self.horizon):
-            # Actor/Critic은 정규화된 상태를 입력으로 받음
-            own_state_norm = self._normalize(current_state_raw)  # (B, D)
+            own_norm = self._normalize(current_own_raw)  # (B, D)
 
-            # 주변 항공기 = 배치 내 다른 항공기 (정규화, 벡터화)
-            traffic_norm = own_state_norm[shift_indices]  # (B, 5, D)
+            # 이 스텝의 트래픽 (정규화)
+            step_traffic_raw = traffic_env[:, step]  # (B, N_traffic, D)
+            step_traffic_norm = (step_traffic_raw - self.norm_mean) / self.norm_std
 
-            # Critic value (축별)
+            # Critic value
             with torch.no_grad():
-                vals = self.target_critic.forward_all(own_state_norm, traffic_norm)
+                vals = self.target_critic.forward_all(own_norm, step_traffic_norm)
             for ax in REWARD_AXES:
                 all_values[ax].append(vals[ax])
 
-            # Actor action
-            action = self.actor.get_action(own_state_norm, traffic_norm)
+            # Actor action (내 항공기 기준, 트래픽 참조)
+            action = self.actor.get_action(own_norm, step_traffic_norm)
             all_actions.append(action)
 
-            # 행동을 상태에 반영 (룩업 테이블, GPU 벡터화)
-            action_deltas = self._action_table[action]  # (B, 3) = [hdg, alt, spd]
+            # 내 항공기에 행동 반영
+            action_deltas = self._action_table[action]
+            modified_raw = current_own_raw.clone()
+            modified_raw[:, 4] = (modified_raw[:, 4] + action_deltas[:, 0]) % 360
+            modified_raw[:, 2] = (modified_raw[:, 2] + action_deltas[:, 1]).clamp(2000, 45000)
+            modified_raw[:, 3] = (modified_raw[:, 3] + action_deltas[:, 2]).clamp(200, 600)
 
-            modified_state_raw = current_state_raw.clone()
-            modified_state_raw[:, 4] = (modified_state_raw[:, 4] + action_deltas[:, 0]) % 360
-            modified_state_raw[:, 2] = (modified_state_raw[:, 2] + action_deltas[:, 1]).clamp(2000, 45000)
-            modified_state_raw[:, 3] = (modified_state_raw[:, 3] + action_deltas[:, 2]).clamp(200, 600)
-
-            # WM prior로 다음 상태 예측
-            modified_norm = self._normalize(modified_state_raw)
+            # WM으로 내 항공기 다음 상태 예측
+            modified_norm = self._normalize(modified_raw)
             with torch.no_grad():
                 state_emb = self.world_model._encode_state(modified_norm)
                 interaction = self.world_model.neighbor_attn(state_emb, empty_ctx)
@@ -548,20 +603,27 @@ class DreamerTrainer:
                 prior_mean, prior_logstd = self.world_model._prior(h_t)
                 z = self.world_model._sample_z(prior_mean, prior_logstd)
                 pred_mean, pred_logstd = self.world_model._decode_state(h_t, z)
-                next_state_norm = self.world_model._sample_z(pred_mean, pred_logstd)
+                next_own_norm = self.world_model._sample_z(pred_mean, pred_logstd)
 
-            next_state_raw = self._denormalize(next_state_norm)
+            next_own_raw = self._denormalize(next_own_norm)
 
-            # ── 돌발 이벤트 주입 (배치 벡터화) ──
-            # 주입된 항공기 위치를 배치 내 일부 항목에 덮어씌움
-            # → 갑자기 위험한 위치에 항공기가 나타난 효과
-            injected, inject_mask = inject_events_batch(next_state_raw, self.device)
-            reward_states = next_state_raw.clone()
-            reward_states[inject_mask] = injected[inject_mask]
+            # 돌발 이벤트: 트래픽에 추가 (내 항공기 근처에 갑자기 나타남)
+            injected_traffic, inject_mask = inject_events_batch(next_own_raw, self.device)
+            # inject된 항공기를 트래픽 마지막 슬롯에 추가
+            reward_traffic = step_traffic_raw.clone()
+            # inject_mask가 True인 배치에 대해 첫 번째 트래픽 슬롯을 주입 항공기로 교체
+            if inject_mask.any():
+                injected_state = torch.stack([
+                    injected_traffic[:, 0], injected_traffic[:, 1], injected_traffic[:, 2],
+                    injected_traffic[:, 3], injected_traffic[:, 4], injected_traffic[:, 5],
+                    injected_traffic[:, 3] - 30, torch.full((B,), 0.75, device=self.device),
+                    torch.zeros(B, device=self.device), torch.zeros(B, device=self.device),
+                ], dim=-1)  # (B, STATE_DIM)
+                reward_traffic[inject_mask, 0] = injected_state[inject_mask]
 
-            # 보상 계산 (GPU 벡터화, 목적지 + 돌발 이벤트 회피)
-            rewards, cur_dist, in_danger = compute_reward_batch(
-                reward_states, action, self.device,
+            # 보상: 내 항공기 vs 트래픽
+            rewards, cur_dist, in_danger = compute_reward_episode(
+                next_own_raw, reward_traffic, action, self.device,
                 dest_lat=dest_lat, dest_lon=dest_lon, dest_alt=dest_alt,
                 prev_dist=prev_dist, is_arrival=is_arrival,
                 injected=inject_mask, prev_in_danger=prev_in_danger)
@@ -571,46 +633,49 @@ class DreamerTrainer:
             for ax in REWARD_AXES:
                 all_rewards[ax].append(rewards[ax])
 
-            current_state_raw = next_state_raw
-            all_states.append(current_state_raw)
+            current_own_raw = next_own_raw
+            all_states.append(current_own_raw)
 
-        # 마지막 스텝 value (bootstrap, 축별)
-        own_norm_final = self._normalize(current_state_raw)
-        traffic_norm_final = own_norm_final[shift_indices]
+        # 마지막 value (bootstrap)
+        own_norm_final = self._normalize(current_own_raw)
+        final_traffic_norm = (traffic_env[:, -1] - self.norm_mean) / self.norm_std
         with torch.no_grad():
-            final_vals = self.target_critic.forward_all(own_norm_final, traffic_norm_final)
+            final_vals = self.target_critic.forward_all(own_norm_final, final_traffic_norm)
 
         return {
-            'states': torch.stack(all_states, dim=1),      # (B, H+1, D)
-            'actions': torch.stack(all_actions, dim=1),     # (B, H)
-            'rewards': {ax: torch.stack(all_rewards[ax], dim=1) for ax in REWARD_AXES},  # {ax: (B,H)}
-            'values': {ax: torch.stack(all_values[ax], dim=1) for ax in REWARD_AXES},    # {ax: (B,H)}
-            'final_value': final_vals,                      # {ax: (B,)}
+            'states': torch.stack(all_states, dim=1),
+            'actions': torch.stack(all_actions, dim=1),
+            'rewards': {ax: torch.stack(all_rewards[ax], dim=1) for ax in REWARD_AXES},
+            'values': {ax: torch.stack(all_values[ax], dim=1) for ax in REWARD_AXES},
+            'final_value': final_vals,
         }
 
-    def compute_returns(self, rewards, values_symlog, final_value_symlog, lam=0.95):
+    def compute_returns(self, rewards, values, final_value, lam=0.95, use_symlog=True):
         """
-        GAE-style lambda returns — symlog space에서 직접 계산.
-        rewards는 raw space이므로 symlog 변환 후 계산.
-        이렇게 하면 symexp 폭발 문제를 방지.
+        GAE-style lambda returns.
+        use_symlog=True: symlog space에서 계산 (efficiency, mission)
+        use_symlog=False: raw space에서 직접 계산 (safety — 패널티 크기 보존)
         """
         H = rewards.shape[1]
-        # rewards를 symlog space로 변환
-        rewards_sl = symlog(rewards)
-        values = values_symlog
-        final_value = final_value_symlog
+
+        if use_symlog:
+            rewards_t = symlog(rewards)
+        else:
+            rewards_t = rewards
 
         returns = torch.zeros_like(rewards)
         last_gae = 0
 
         for t in reversed(range(H)):
             next_v = final_value if t == H - 1 else values[:, t + 1]
-            delta = rewards_sl[:, t] + self.gamma * next_v - values[:, t]
+            delta = rewards_t[:, t] + self.gamma * next_v - values[:, t]
             last_gae = delta + self.gamma * lam * last_gae
             returns[:, t] = last_gae + values[:, t]
 
-        # returns는 이미 symlog space — 클램프로 안전 보장
-        return returns.clamp(-10, 10)
+        if use_symlog:
+            return returns.clamp(-10, 10)
+        else:
+            return returns.clamp(-200, 200)
 
     def train_step(self, initial_states_norm, initial_contexts):
         """
@@ -623,10 +688,13 @@ class DreamerTrainer:
         rollout = self.imagine_rollout(initial_states_norm, initial_contexts)
 
         # 축별 returns 계산
+        # safety: raw space (패널티 크기를 압축 없이 직접 반영)
+        # efficiency/mission: symlog space (기존)
         returns_per_axis = {}
         for ax in REWARD_AXES:
             returns_per_axis[ax] = self.compute_returns(
-                rollout['rewards'][ax], rollout['values'][ax], rollout['final_value'][ax])
+                rollout['rewards'][ax], rollout['values'][ax], rollout['final_value'][ax],
+                use_symlog=(ax != 'safety'))
 
         # 공통 준비
         states_raw_flat = rollout['states'][:, :-1].reshape(-1, STATE_DIM)
@@ -638,21 +706,27 @@ class DreamerTrainer:
         own_flat = ((own_states - self.norm_mean) / self.norm_std).reshape(B * H, D)
         traffic_flat_a = torch.zeros(B * H, 5, STATE_DIM, device=self.device)
 
-        # ── 각 Critic head 독립 학습 ──
+        # ── 각 Critic head 독립 학습 (독립 optimizer) ──
         critic_losses = {}
-        symlog_targets_per_axis = {}
+        targets_per_axis = {}
         for ax in REWARD_AXES:
-            targets = torch.nan_to_num(returns_per_axis[ax].reshape(-1).detach(), nan=0.0).clamp(-10, 10)
-            symlog_targets_per_axis[ax] = targets
+            raw_targets = returns_per_axis[ax].reshape(-1).detach()
+            if ax == 'safety':
+                # raw space: 클램프만 적용 (symlog 없음)
+                targets = torch.nan_to_num(raw_targets, nan=0.0).clamp(-200, 200)
+            else:
+                # symlog space
+                targets = torch.nan_to_num(raw_targets, nan=0.0).clamp(-10, 10)
+            targets_per_axis[ax] = targets
             pred = self.critic.heads[ax](states_flat, traffic_flat)
             loss = F.mse_loss(pred, targets)
             critic_losses[ax] = loss.item()
 
             if torch.isfinite(loss):
-                self.critic_opt.zero_grad()
+                self.critic_opts[ax].zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-                self.critic_opt.step()
+                torch.nn.utils.clip_grad_norm_(self.critic.heads[ax].parameters(), 1.0)
+                self.critic_opts[ax].step()
 
         # ── GAN-style 가중치: 못하는 축이 더 강하게 당김 ──
         with torch.no_grad():
@@ -684,7 +758,7 @@ class DreamerTrainer:
         for ax in REWARD_AXES:
             with torch.no_grad():
                 v = self.critic.heads[ax](own_flat, traffic_flat_a)
-            adv = (symlog_targets_per_axis[ax] - v).detach()
+            adv = (targets_per_axis[ax] - v).detach()
             adv = torch.nan_to_num(adv, nan=0.0)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             adv = adv.clamp(-5, 5)
@@ -738,7 +812,7 @@ class DreamerTrainer:
             'critic': self.critic.state_dict(),
             'target_critic': self.target_critic.state_dict(),
             'actor_opt': self.actor_opt.state_dict(),
-            'critic_opt': self.critic_opt.state_dict(),
+            'critic_opts': {ax: opt.state_dict() for ax, opt in self.critic_opts.items()},
             'total_episodes': self.total_episodes,
             'total_crashes': self.total_crashes,
             'total_safe': self.total_safe,
@@ -751,7 +825,11 @@ class DreamerTrainer:
             self.critic.load_state_dict(ckpt['critic'])
             self.target_critic.load_state_dict(ckpt['target_critic'])
             self.actor_opt.load_state_dict(ckpt['actor_opt'])
-            self.critic_opt.load_state_dict(ckpt['critic_opt'])
+            if 'critic_opts' in ckpt:
+                for ax, state in ckpt['critic_opts'].items():
+                    self.critic_opts[ax].load_state_dict(state)
+            elif 'critic_opt' in ckpt:
+                pass  # 이전 형식 호환 — 무시하고 새 optimizer 사용
             print(f"[Dreamer] Loaded actor/critic from checkpoint")
         else:
             print(f"[Dreamer] No actor/critic in checkpoint - starting fresh")

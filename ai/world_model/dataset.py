@@ -204,16 +204,43 @@ class TrajectoryDataset(Dataset):
     def get_norm_params(self):
         return torch.from_numpy(NORM_MEAN), torch.from_numpy(NORM_STD)
 
-    def preload(self):
+    def preload(self, cache_dir=None):
         """
         전체 데이터셋을 메모리에 프리로드.
-        __getitem__을 모든 인덱스에 대해 호출하여 텐서 캐시를 구축.
-        이후 __getitem__은 DB 쿼리 없이 메모리에서 반환.
+        .pt 캐시 파일이 있고 샘플 수가 일치하면 즉시 로드 (~5초).
+        없으면 DB에서 빌드 후 캐시 저장.
         """
-        import sys
+        import os
         N = len(self.index)
-        print(f"[Dataset] Preloading {N} samples into memory...")
 
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
+            cache_dir = os.path.normpath(cache_dir)
+        cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}.pt')
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+        # 캐시 로드 시도
+        if os.path.exists(cache_path):
+            try:
+                cache = torch.load(cache_path, map_location='cpu', weights_only=True)
+                if cache['n'] == N:
+                    self._cache_past = cache['past']
+                    self._cache_future = cache['future']
+                    self._cache_ctx = cache['ctx']
+                    self._cache_msk = cache['msk']
+                    self._cache_future_raw = cache['future_raw']
+                    self._preloaded = True
+                    mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
+                             self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
+                    print(f"[Dataset] Cache hit: {N} samples, {mb:.0f}MB loaded in ~5s")
+                    return
+                else:
+                    print(f"[Dataset] Cache stale ({cache['n']} vs {N}), rebuilding...")
+            except Exception as e:
+                print(f"[Dataset] Cache failed: {e}, rebuilding...")
+
+        # DB에서 빌드
+        print(f"[Dataset] Preloading {N} samples from DB...")
         self._cache_past = torch.zeros(N, self.past_steps, STATE_DIM)
         self._cache_future = torch.zeros(N, self.future_steps, STATE_DIM)
         self._cache_ctx = torch.zeros(N, self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM)
@@ -228,16 +255,26 @@ class TrajectoryDataset(Dataset):
             self._cache_msk[i] = msk
             self._cache_future_raw[i] = future_raw
             if (i + 1) % 5000 == 0:
-                mb = (self._cache_past.nbytes + self._cache_future.nbytes +
-                      self._cache_ctx.nbytes + self._cache_msk.nbytes +
-                      self._cache_future_raw.nbytes) / 1024 / 1024
+                mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
+                         self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
                 print(f"[Dataset] Preloaded {i+1}/{N} ({mb:.0f}MB)")
 
         self._preloaded = True
-        mb = (self._cache_past.nbytes + self._cache_future.nbytes +
-              self._cache_ctx.nbytes + self._cache_msk.nbytes +
-              self._cache_future_raw.nbytes) / 1024 / 1024
-        print(f"[Dataset] Preload complete: {N} samples, {mb:.0f}MB in RAM")
+        mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
+                 self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
+        print(f"[Dataset] Preload complete: {N} samples, {mb:.0f}MB")
+
+        # 캐시 저장
+        try:
+            torch.save({
+                'n': N, 'past': self._cache_past, 'future': self._cache_future,
+                'ctx': self._cache_ctx, 'msk': self._cache_msk,
+                'future_raw': self._cache_future_raw,
+            }, cache_path)
+            sz = os.path.getsize(cache_path) / 1024 / 1024
+            print(f"[Dataset] Cache saved: {cache_path} ({sz:.0f}MB)")
+        except Exception as e:
+            print(f"[Dataset] Cache save failed: {e}")
 
     def _load_item(self, idx):
         """DB에서 단일 샘플 로드 (원래 __getitem__ 로직)."""

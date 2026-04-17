@@ -75,63 +75,6 @@ def load_model(model_path, device):
     return model
 
 
-def load_critic(dreamer_path, device):
-    if not os.path.exists(dreamer_path):
-        print(f"[ATC] Dreamer checkpoint not found: {dreamer_path}")
-        return None
-    try:
-        from ai.world_model.dreamer_policy import Critic
-        ckpt = torch.load(dreamer_path, map_location=device, weights_only=False)
-        critic = Critic().to(device)
-        critic.load_state_dict(ckpt['critic'])
-        critic.eval()
-        ep = ckpt.get('total_episodes', '?')
-        print(f"[ATC] Critic loaded ({ep} episodes)")
-        return critic
-    except Exception as e:
-        print(f"[ATC] Critic load failed: {e}")
-        return None
-
-
-def compute_risk_scores(critic, all_tracked, device):
-    if not critic or len(all_tracked) < 1:
-        return {}
-    norm_mean = torch.from_numpy(NORM_MEAN).to(device)
-    norm_std = torch.from_numpy(NORM_STD).to(device)
-    icaos = list(all_tracked.keys())
-    states_raw = []
-    for icao in icaos:
-        ac = all_tracked[icao]
-        s = torch.tensor([
-            ac.lat, ac.lon, ac.alt_current,
-            ac.ground_speed_kt, ac.track_true_deg,
-            getattr(ac, 'vertical_rate_ft_min', 0) or 0,
-            getattr(ac, 'ias_kt', 0) or 0,
-            getattr(ac, 'mach', 0) or 0,
-            getattr(ac, 'wind_direction_deg', 0) or 0,
-            getattr(ac, 'wind_speed_kt', 0) or 0,
-        ], dtype=torch.float32, device=device)
-        states_raw.append(s)
-
-    states = torch.stack(states_raw)
-    states_norm = (states - norm_mean) / norm_std
-    N = len(icaos)
-    traffic_norm = torch.zeros(N, 5, STATE_DIM, device=device)
-    if N > 1:
-        lat = states[:, 0]
-        lon = states[:, 1]
-        dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0
-        cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1)
-        dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat
-        dists = torch.sqrt(dlat**2 + dlon**2)
-        dists.fill_diagonal_(1e9)
-        k = min(5, N - 1)
-        _, indices = dists.topk(k, dim=1, largest=False)
-        for i in range(k):
-            traffic_norm[:, i] = states_norm[indices[:, i]]
-    risks = critic.risk_score(states_norm, traffic_norm)
-    return {icao: risks[i].item() for i, icao in enumerate(icaos)}
-
 
 def linear_extrapolate(ac, steps=12, dt=10.0):
     from config import KNOTS_TO_MPS, M_TO_NM
@@ -737,26 +680,29 @@ def main():
             s = render_text_with_simple_outline(sim.font, label, border_color, BLACK)
             sim.screen.blit(s, (int(avg_x) - s.get_width() // 2, int(avg_y) - 8))
 
-        # ── Conflict 라인 ──
-        for ac_a, ac_b, cp in conflict_lines:
-            ax, ay = sim.map.latlon_to_screen(ac_a.lat, ac_a.lon)
-            bx, by = sim.map.latlon_to_screen(ac_b.lat, ac_b.lon)
-            ax, ay, bx, by = int(ax), int(ay), int(bx), int(by)
-            if cp.probability >= 0.7:
-                line_color = RED
-            elif cp.probability >= 0.4:
-                line_color = ORANGE
-            elif cp.probability >= 0.2:
-                line_color = YELLOW
-            else:
-                line_color = (100, 255, 100)
-            thickness = max(1, int(cp.probability * 4))
-            pygame.draw.line(sim.screen, line_color, (ax, ay), (bx, by), thickness)
-            mx, my = (ax + bx) // 2, (ay + by) // 2
-            s = render_text_with_simple_outline(sim.font, f"{cp.probability*100:.0f}%", line_color, BLACK)
-            sim.screen.blit(s, (mx - s.get_width() // 2, my - 20))
-            s2 = render_text_with_simple_outline(sim.font, f"{cp.expected_time_sec:.0f}s", (200, 200, 200), BLACK)
-            sim.screen.blit(s2, (mx - s2.get_width() // 2, my + 2))
+        # ── Conflict 라인 (alert 기반) ──
+        for alert in conflict_alerts:
+            if len(alert.aircraft_involved) >= 2 and alert.position:
+                cs_a, cs_b = alert.aircraft_involved[0], alert.aircraft_involved[1]
+                ac_a = all_tracked.get(cs_a)
+                ac_b = all_tracked.get(cs_b)
+                if not ac_a:
+                    for k, v in all_tracked.items():
+                        if getattr(v, 'callsign', '') == cs_a:
+                            ac_a = v; break
+                if not ac_b:
+                    for k, v in all_tracked.items():
+                        if getattr(v, 'callsign', '') == cs_b:
+                            ac_b = v; break
+                if ac_a and ac_b:
+                    ax, ay = sim.map.latlon_to_screen(ac_a.lat, ac_a.lon)
+                    bx, by = sim.map.latlon_to_screen(ac_b.lat, ac_b.lon)
+                    sev_col = {Severity.ALERT: RED, Severity.WARNING: ORANGE, Severity.CAUTION: YELLOW}
+                    line_color = sev_col.get(alert.severity, YELLOW)
+                    pygame.draw.line(sim.screen, line_color, (int(ax), int(ay)), (int(bx), int(by)), 2)
+                    mx, my = (int(ax) + int(bx)) // 2, (int(ay) + int(by)) // 2
+                    s = render_text_with_simple_outline(sim.font, alert.title, line_color, BLACK)
+                    sim.screen.blit(s, (mx - s.get_width() // 2, my - 10))
 
         # ── 선택 항공기 예측 궤적 ──
         if pred_trajs is not None and selected_icao in all_tracked:

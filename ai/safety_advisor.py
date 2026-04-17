@@ -236,6 +236,10 @@ class SafetyAdvisor:
             own_norm = all_norm[ui].unsqueeze(0)
             with torch.no_grad():
                 overall_risk = self._critic.risk_score(own_norm, traffic_norm).item()
+                axis = self._critic.axis_scores(own_norm, traffic_norm)
+                ai_safety = axis['safety'].item()
+                ai_efficiency = axis['efficiency'].item()
+                ai_mission = axis['mission'].item()
 
             callsign = getattr(uac, 'callsign', '') or getattr(uac, 'icao24', '?')
 
@@ -329,7 +333,9 @@ class SafetyAdvisor:
             factors['speed'] = (spd_risk, spd_detail)
 
             # 5. Overall (Critic 종합)
-            factors['overall'] = (overall_risk, "AI Value Function")
+            factors['ai_safety'] = (ai_safety, "AI Safety")
+            factors['ai_efficiency'] = (ai_efficiency, "AI Efficiency")
+            factors['ai_mission'] = (ai_mission, "AI Mission")
 
             # 경고 임계값: 어느 요인이든 75% 이상이면 경고
             max_factor_risk = max(r for r, _ in factors.values())
@@ -352,8 +358,9 @@ class SafetyAdvisor:
                     continue
                 label = {
                     'separation': 'SEP', 'convergence': 'CONV',
-                    'altitude': 'ALT', 'speed': 'SPD', 'overall': 'AI',
-                }[fname]
+                    'altitude': 'ALT', 'speed': 'SPD',
+                    'ai_safety': 'AI:S', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
+                }.get(fname, fname)
                 factor_lines.append(f"{label}:{frisk:.0%}")
                 if fdetail:
                     factor_lines[-1] += f"({fdetail})"

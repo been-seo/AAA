@@ -3,8 +3,7 @@ __pycache__/
 .claude/
 
 # 데이터/모델 (대용량)
-data/recordings/
-data/tile_cache_osm/
+data/
 models/
 
 # OS/IDE
