@@ -562,6 +562,7 @@ class DreamerTrainer:
         # Imagination rollout
         all_states = [current_own_raw]
         all_actions = []
+        all_traffic = []  # 매 스텝 트래픽 저장 (Critic 학습용)
         all_rewards = {ax: [] for ax in REWARD_AXES}
         all_values = {ax: [] for ax in REWARD_AXES}
         prev_in_danger = torch.zeros(B, dtype=torch.bool, device=self.device)
@@ -574,6 +575,7 @@ class DreamerTrainer:
             # 이 스텝의 트래픽 (정규화)
             step_traffic_raw = traffic_env[:, step]  # (B, N_traffic, D)
             step_traffic_norm = (step_traffic_raw - self.norm_mean) / self.norm_std
+            all_traffic.append(step_traffic_norm)
 
             # Critic value
             with torch.no_grad():
@@ -645,6 +647,7 @@ class DreamerTrainer:
         return {
             'states': torch.stack(all_states, dim=1),
             'actions': torch.stack(all_actions, dim=1),
+            'traffic': torch.stack(all_traffic, dim=1),  # (B, H, N_traffic, D) 정규화됨
             'rewards': {ax: torch.stack(all_rewards[ax], dim=1) for ax in REWARD_AXES},
             'values': {ax: torch.stack(all_values[ax], dim=1) for ax in REWARD_AXES},
             'final_value': final_vals,
@@ -697,14 +700,14 @@ class DreamerTrainer:
                 use_symlog=(ax != 'safety'))
 
         # 공통 준비
-        states_raw_flat = rollout['states'][:, :-1].reshape(-1, STATE_DIM)
-        states_flat = (states_raw_flat - self.norm_mean) / self.norm_std
-        traffic_flat = torch.zeros(states_flat.shape[0], 5, STATE_DIM, device=self.device)
-
-        own_states = rollout['states'][:, :-1]
+        own_states = rollout['states'][:, :-1]  # (B, H, D) raw
         B, H, D = own_states.shape
         own_flat = ((own_states - self.norm_mean) / self.norm_std).reshape(B * H, D)
-        traffic_flat_a = torch.zeros(B * H, 5, STATE_DIM, device=self.device)
+
+        # 실제 트래픽 (rollout에서 저장된 정규화 텐서)
+        traffic_all = rollout['traffic']  # (B, H, N_traffic, STATE_DIM) 정규화됨
+        N_t = traffic_all.shape[2]
+        traffic_flat = traffic_all.reshape(B * H, N_t, STATE_DIM)  # (B*H, N_traffic, D)
 
         # ── 각 Critic head 독립 학습 (독립 optimizer) ──
         critic_losses = {}
@@ -718,7 +721,7 @@ class DreamerTrainer:
                 # symlog space
                 targets = torch.nan_to_num(raw_targets, nan=0.0).clamp(-10, 10)
             targets_per_axis[ax] = targets
-            pred = self.critic.heads[ax](states_flat, traffic_flat)
+            pred = self.critic.heads[ax](own_flat, traffic_flat)
             loss = F.mse_loss(pred, targets)
             critic_losses[ax] = loss.item()
 
@@ -734,20 +737,17 @@ class DreamerTrainer:
             losses = losses.clamp(min=0.1)
             # 높은 loss = 못하는 축 = 더 높은 가중치
             weights = losses / losses.sum()
-            # safety는 최소 보장 (하한 40%)
+            # 가중치 하한/상한: safety 40~80%, efficiency/mission 각 최소 10%
             w_dict = {ax: weights[i].item() for i, ax in enumerate(REWARD_AXES)}
-            if w_dict['safety'] < 0.4:
-                deficit = 0.4 - w_dict['safety']
-                w_dict['safety'] = 0.4
-                # 다른 축에서 비례 감소
-                other_sum = sum(w_dict[a] for a in REWARD_AXES if a != 'safety')
-                if other_sum > 0:
-                    for a in REWARD_AXES:
-                        if a != 'safety':
-                            w_dict[a] -= deficit * (w_dict[a] / other_sum)
+            w_dict['safety'] = max(0.4, min(0.8, w_dict['safety']))
+            w_dict['efficiency'] = max(0.1, w_dict['efficiency'])
+            w_dict['mission'] = max(0.1, w_dict['mission'])
+            # 정규화
+            total = sum(w_dict.values())
+            w_dict = {ax: v / total for ax, v in w_dict.items()}
 
         # ── Actor 업데이트: 3축 가중합 advantage ──
-        logits = self.actor(own_flat, traffic_flat_a)
+        logits = self.actor(own_flat, traffic_flat)
         logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
         dist = torch.distributions.Categorical(logits=logits)
         actions_flat = rollout['actions'].reshape(B * H)
@@ -757,7 +757,7 @@ class DreamerTrainer:
         total_advantage = torch.zeros(B * H, device=self.device)
         for ax in REWARD_AXES:
             with torch.no_grad():
-                v = self.critic.heads[ax](own_flat, traffic_flat_a)
+                v = self.critic.heads[ax](own_flat, traffic_flat)
             adv = (targets_per_axis[ax] - v).detach()
             adv = torch.nan_to_num(adv, nan=0.0)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)

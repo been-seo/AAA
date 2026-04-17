@@ -207,10 +207,12 @@ class TrajectoryDataset(Dataset):
     def preload(self, cache_dir=None):
         """
         전체 데이터셋을 메모리에 프리로드.
-        .pt 캐시 파일이 있고 샘플 수가 일치하면 즉시 로드 (~5초).
-        없으면 DB에서 빌드 후 캐시 저장.
+        1. 캐시 일치 → 즉시 로드
+        2. 캐시 stale → 기존 캐시 먼저 로드 (부분 사용), 신규 분은 백그라운드 빌드
+        3. 캐시 없음 → 전체 DB 빌드
         """
         import os
+        import threading
         N = len(self.index)
 
         if cache_dir is None:
@@ -219,11 +221,13 @@ class TrajectoryDataset(Dataset):
         cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}.pt')
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-        # 캐시 로드 시도
+        cached_n = 0
         if os.path.exists(cache_path):
             try:
                 cache = torch.load(cache_path, map_location='cpu', weights_only=True)
-                if cache['n'] == N:
+                cached_n = cache['n']
+                if cached_n == N:
+                    # 완전 일치 — 즉시 로드
                     self._cache_past = cache['past']
                     self._cache_future = cache['future']
                     self._cache_ctx = cache['ctx']
@@ -232,14 +236,56 @@ class TrajectoryDataset(Dataset):
                     self._preloaded = True
                     mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
                              self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
-                    print(f"[Dataset] Cache hit: {N} samples, {mb:.0f}MB loaded in ~5s")
+                    print(f"[Dataset] Cache hit: {N} samples, {mb:.0f}MB")
+                    return
+                elif cached_n < N:
+                    # stale — 기존 캐시 먼저 로드, 신규 분은 백그라운드
+                    print(f"[Dataset] Cache partial ({cached_n}/{N}), loading cached + bg update")
+                    self._cache_past = torch.zeros(N, self.past_steps, STATE_DIM)
+                    self._cache_future = torch.zeros(N, self.future_steps, STATE_DIM)
+                    self._cache_ctx = torch.zeros(N, self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM)
+                    self._cache_msk = torch.zeros(N, self.total_steps, STATE_DIM)
+                    self._cache_future_raw = torch.zeros(N, self.future_steps, STATE_DIM)
+                    # 기존 캐시 복사
+                    self._cache_past[:cached_n] = cache['past']
+                    self._cache_future[:cached_n] = cache['future']
+                    self._cache_ctx[:cached_n] = cache['ctx']
+                    self._cache_msk[:cached_n] = cache['msk']
+                    self._cache_future_raw[:cached_n] = cache['future_raw']
+                    self._preloaded = True
+                    del cache
+                    print(f"[Dataset] Loaded {cached_n} cached, training can start")
+                    # 나머지를 백그라운드에서 빌드
+                    def _bg_build():
+                        for i in range(cached_n, N):
+                            past, future, ctx, msk, future_raw = self._load_item(i)
+                            self._cache_past[i] = past
+                            self._cache_future[i] = future
+                            self._cache_ctx[i] = ctx
+                            self._cache_msk[i] = msk
+                            self._cache_future_raw[i] = future_raw
+                            if (i + 1 - cached_n) % 5000 == 0:
+                                print(f"[Dataset BG] {i+1}/{N} ({i+1-cached_n} new)")
+                        print(f"[Dataset BG] Complete: {N} samples")
+                        try:
+                            torch.save({
+                                'n': N, 'past': self._cache_past, 'future': self._cache_future,
+                                'ctx': self._cache_ctx, 'msk': self._cache_msk,
+                                'future_raw': self._cache_future_raw,
+                            }, cache_path)
+                            sz = os.path.getsize(cache_path) / 1024 / 1024
+                            print(f"[Dataset BG] Cache saved ({sz:.0f}MB)")
+                        except Exception as e:
+                            print(f"[Dataset BG] Cache save failed: {e}")
+                    t = threading.Thread(target=_bg_build, daemon=True)
+                    t.start()
                     return
                 else:
-                    print(f"[Dataset] Cache stale ({cache['n']} vs {N}), rebuilding...")
+                    print(f"[Dataset] Cache bigger than dataset ({cached_n} > {N}), rebuilding...")
             except Exception as e:
                 print(f"[Dataset] Cache failed: {e}, rebuilding...")
 
-        # DB에서 빌드
+        # 캐시 없음 — 전체 DB 빌드
         print(f"[Dataset] Preloading {N} samples from DB...")
         self._cache_past = torch.zeros(N, self.past_steps, STATE_DIM)
         self._cache_future = torch.zeros(N, self.future_steps, STATE_DIM)
@@ -264,7 +310,6 @@ class TrajectoryDataset(Dataset):
                  self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
         print(f"[Dataset] Preload complete: {N} samples, {mb:.0f}MB")
 
-        # 캐시 저장
         try:
             torch.save({
                 'n': N, 'past': self._cache_past, 'future': self._cache_future,

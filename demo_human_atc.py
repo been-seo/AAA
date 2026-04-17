@@ -159,13 +159,16 @@ def generate_scenario(ac):
 
     if stype == "departure":
         # 공항 → 공역: 가까운 MOA로 배정
-        moas = [m for m in MOA_LIST if m.get("coords")]
+        moas = [m for m in MOA_LIST if m.get("vertices") or m.get("coords")]
         if not moas:
             moas = MOA_LIST[:3]
         moa = random.choice(moas)
-        coords = moa.get("coords", [])
-        moa_lat = sum(c[0] for c in coords) / len(coords)
-        moa_lon = sum(c[1] for c in coords) / len(coords)
+        coords = moa.get("vertices") or moa.get("coords") or []
+        if coords:
+            moa_lat = sum(c[0] for c in coords) / len(coords)
+            moa_lon = sum(c[1] for c in coords) / len(coords)
+        else:
+            moa_lat, moa_lon = 36.5, 127.5
         moa_name = moa.get("name", "MOA")
         cruise_alt = random.choice([15000, 20000, 25000])
         dest = {"icao": "", "name": moa_name, "lat": moa_lat, "lon": moa_lon, "mil": True}
