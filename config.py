@@ -31,8 +31,8 @@ MAGNETIC_DECLINATION = 7.0  # 한국 자기 편각 (도)
 # ── 항공기 기동 ──
 HDG_RATE_QUICK = 15.0        # 도/초
 HDG_RATE_NORMAL = 5.0        # 도/초
-PEAK_ALT_RATE_NORMAL_FPS = 7500 / 60.0  # ft/초
-ALT_RATE_QUICK = 10000 / 60.0           # ft/초
+PEAK_ALT_RATE_NORMAL_FPS = 12000 / 60.0  # ft/초 (12000fpm)
+ALT_RATE_QUICK = 20000 / 60.0           # ft/초 (20000fpm)
 SPD_RATE_QUICK = 40.0        # kts/초
 SPD_RATE_NORMAL = 20.0       # kts/초
 INSTRUCTION_DELAY = 0.0      # 초 (학습 시 0)

@@ -61,35 +61,42 @@ def symexp(x):
 # ── 행동 공간 ──
 # 관제 지시: (delta_hdg, delta_alt, delta_spd)
 # delta_hdg: -30, -15, -5, 0, +5, +15, +30 (7)
-# delta_alt: -2000, -1000, 0, +1000, +2000 (5)
-# delta_spd: -50, 0, +50 (3)
-# 총: 7 * 5 * 3 = 105 + 1(유지) = 106
-HDG_DELTAS = [-30, -15, -5, 0, 5, 15, 30]
-ALT_DELTAS = [-2000, -1000, 0, 1000, 2000]
+# HDG: 0, 10, 20, ..., 350 (36개) — 목표 방위 직접 지정
+# ALT: 7500, 8500, ..., 44500 (38개) — 목표 고도 직접 지정
+# SPD: -50, 0, +50 (3개) — 속도 변경
+# RATE: normal, quick (2개) — 상승/하강률
+# HOLD: 1개
+# 총: 36 * 38 * 3 * 2 + 1 = 8209
+HDG_TARGETS = list(range(0, 360, 10))       # [0, 10, 20, ..., 350]
+ALT_TARGETS = list(range(7500, 45000, 1000)) # [7500, 8500, ..., 44500]
 SPD_DELTAS = [-50, 0, 50]
-NUM_ACTIONS = len(HDG_DELTAS) * len(ALT_DELTAS) * len(SPD_DELTAS) + 1  # +1 = HOLD
+RATE_OPTIONS = [0, 1]  # 0=normal, 1=quick
+NUM_ACTIONS = len(HDG_TARGETS) * len(ALT_TARGETS) * len(SPD_DELTAS) * len(RATE_OPTIONS) + 1
 
-def action_to_deltas(action_idx):
-    """이산 행동 → (delta_hdg, delta_alt, delta_spd) — 단건 조회용"""
+def action_to_instruction(action_idx):
+    """이산 행동 → (hdg_target, alt_target, delta_spd, quick) — 단건 조회용"""
     if action_idx == NUM_ACTIONS - 1:
-        return (0, 0, 0)  # HOLD
+        return None  # HOLD
+    n_rate = len(RATE_OPTIONS)
     n_spd = len(SPD_DELTAS)
-    n_alt = len(ALT_DELTAS)
-    spd_i = action_idx % n_spd
-    alt_i = (action_idx // n_spd) % n_alt
-    hdg_i = action_idx // (n_spd * n_alt)
-    return (HDG_DELTAS[hdg_i], ALT_DELTAS[alt_i], SPD_DELTAS[spd_i])
+    n_alt = len(ALT_TARGETS)
+    rate_i = action_idx % n_rate
+    spd_i = (action_idx // n_rate) % n_spd
+    alt_i = (action_idx // (n_rate * n_spd)) % n_alt
+    hdg_i = action_idx // (n_rate * n_spd * n_alt)
+    return (HDG_TARGETS[hdg_i], ALT_TARGETS[alt_i], SPD_DELTAS[spd_i], RATE_OPTIONS[rate_i])
 
 
 # ── 배치 행동 룩업 테이블 (GPU 벡터화) ──
 def _build_action_table(device):
-    """모든 행동의 (delta_hdg, delta_alt, delta_spd) 테이블. (NUM_ACTIONS, 3)"""
+    """모든 행동의 (hdg_target, alt_target, delta_spd, quick) 테이블. (NUM_ACTIONS, 4)"""
     table = []
-    for h in HDG_DELTAS:
-        for a in ALT_DELTAS:
+    for h in HDG_TARGETS:
+        for a in ALT_TARGETS:
             for s in SPD_DELTAS:
-                table.append([h, a, s])
-    table.append([0, 0, 0])  # HOLD
+                for r in RATE_OPTIONS:
+                    table.append([h, a, s, r])
+    table.append([0, 0, 0, 0])  # HOLD (현재 유지)
     return torch.tensor(table, dtype=torch.float32, device=device)
 
 
@@ -205,21 +212,20 @@ def compute_reward_episode(own_state, traffic_states, action, device,
 class Actor(nn.Module):
     """관제 정책: 상태 → 행동 확률분포"""
 
-    def __init__(self, state_dim=STATE_DIM, hidden_dim=256):
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=512):
         super().__init__()
-        # 자기 상태 + 주변 요약 = state_dim + 64
         self.state_enc = nn.Sequential(
-            nn.Linear(state_dim, 128), nn.ELU(),
-            nn.Linear(128, 128), nn.ELU(),
+            nn.Linear(state_dim, 256), nn.ELU(),
+            nn.Linear(256, 256), nn.ELU(),
         )
         self.traffic_enc = nn.Sequential(
-            nn.Linear(state_dim * 5, 128), nn.ELU(),  # 주변 5대 상태 concat
-            nn.Linear(128, 64), nn.ELU(),
+            nn.Linear(state_dim * 5, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
         )
         self.policy_head = nn.Sequential(
-            nn.Linear(128 + 64, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, 128), nn.ELU(),
-            nn.Linear(128, NUM_ACTIONS),
+            nn.Linear(256 + 128, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
+            nn.Linear(hidden_dim, NUM_ACTIONS),
         )
 
     def forward(self, own_state, traffic_states):
@@ -587,12 +593,17 @@ class DreamerTrainer:
             action = self.actor.get_action(own_norm, step_traffic_norm)
             all_actions.append(action)
 
-            # 내 항공기에 행동 반영
-            action_deltas = self._action_table[action]
+            # 내 항공기에 행동 반영 (target 방식)
+            # action_table: (hdg_target, alt_target, delta_spd, quick)
+            act_params = self._action_table[action]  # (B, 4)
+            is_hold = (action == NUM_ACTIONS - 1)
             modified_raw = current_own_raw.clone()
-            modified_raw[:, 4] = (modified_raw[:, 4] + action_deltas[:, 0]) % 360
-            modified_raw[:, 2] = (modified_raw[:, 2] + action_deltas[:, 1]).clamp(2000, 45000)
-            modified_raw[:, 3] = (modified_raw[:, 3] + action_deltas[:, 2]).clamp(200, 600)
+            # HDG: 목표 방위로 설정 (HOLD면 현재 유지)
+            modified_raw[:, 4] = torch.where(is_hold, modified_raw[:, 4], act_params[:, 0])
+            # ALT: 목표 고도로 설정
+            modified_raw[:, 2] = torch.where(is_hold, modified_raw[:, 2], act_params[:, 1].clamp(2000, 45000))
+            # SPD: delta 적용
+            modified_raw[:, 3] = (modified_raw[:, 3] + act_params[:, 2]).clamp(200, 600)
 
             # WM으로 내 항공기 다음 상태 예측
             modified_norm = self._normalize(modified_raw)

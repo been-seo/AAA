@@ -88,26 +88,50 @@ def launch_gui_process(conn):
             layout.addWidget(QtWidgets.QLabel("ALT(ft)"), 0, 0)
             self.alt = QtWidgets.QLineEdit(str(int(data['alt'])))
             layout.addWidget(self.alt, 0, 1)
-            layout.addWidget(QtWidgets.QLabel("SPD(kts)"), 1, 0)
+
+            # Quick ALT 버튼들
+            alt_btn_layout = QtWidgets.QHBoxLayout()
+            for delta, label in [(-10000, "-10k"), (-5000, "-5k"), (+5000, "+5k"), (+10000, "+10k")]:
+                b = QtWidgets.QPushButton(label)
+                b.setFixedWidth(50)
+                b.clicked.connect(lambda checked, d=delta: self._quick_alt(d))
+                alt_btn_layout.addWidget(b)
+            quick_alt_check = QtWidgets.QCheckBox("Quick")
+            quick_alt_check.setToolTip("고속 상승/하강 (20000fpm)")
+            self.quick_alt_check = quick_alt_check
+            alt_btn_layout.addWidget(quick_alt_check)
+            layout.addLayout(alt_btn_layout, 1, 0, 1, 2)
+
+            layout.addWidget(QtWidgets.QLabel("SPD(kts)"), 2, 0)
             self.spd = QtWidgets.QLineEdit(str(int(data['spd'])))
-            layout.addWidget(self.spd, 1, 1)
-            layout.addWidget(QtWidgets.QLabel("HDG(\u00b0)"), 2, 0)
+            layout.addWidget(self.spd, 2, 1)
+            layout.addWidget(QtWidgets.QLabel("HDG(\u00b0)"), 3, 0)
             self.hdg = QtWidgets.QLineEdit(str(int(data['hdg'])))
-            layout.addWidget(self.hdg, 2, 1)
+            layout.addWidget(self.hdg, 3, 1)
             btn = QtWidgets.QPushButton("지시")
             btn.clicked.connect(self._submit)
-            layout.addWidget(btn, 3, 0, 1, 2)
+            layout.addWidget(btn, 4, 0, 1, 2)
             self.setLayout(layout)
             self.activateWindow()
 
+        def _quick_alt(self, delta):
+            try:
+                cur = float(self.alt.text())
+                self.alt.setText(str(max(2000, int(cur + delta))))
+            except ValueError:
+                pass
+
         def _submit(self):
             try:
-                conn.send({
+                msg = {
                     "type": "instruction",
                     "alt": float(self.alt.text()),
                     "spd": float(self.spd.text()),
                     "hdg": float(self.hdg.text()),
-                })
+                }
+                if self.quick_alt_check.isChecked():
+                    msg["quick_alt"] = True
+                conn.send(msg)
             except ValueError:
                 pass
             self.close()

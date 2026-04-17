@@ -9,7 +9,7 @@ import pygame
 from config import (
     KNOTS_TO_MPS, M_TO_NM,
     HDG_RATE_NORMAL, SPD_RATE_NORMAL,
-    PEAK_ALT_RATE_NORMAL_FPS, INSTRUCTION_DELAY,
+    PEAK_ALT_RATE_NORMAL_FPS, ALT_RATE_QUICK, INSTRUCTION_DELAY,
     BLUE, CYAN, RED, YELLOW, BLACK, WHITE,
     SCREEN_WIDTH, SCREEN_HEIGHT, INITIAL_ZOOM_LEVEL,
 )
@@ -178,7 +178,8 @@ class Aircraft:
 
             if self.alt_change_progress < 1.0:
                 factor = alt_normal_rate_factor(self.alt_change_progress)
-                delta_alt = PEAK_ALT_RATE_NORMAL_FPS * factor * dt * self._alt_change_direction
+                rate = ALT_RATE_QUICK if self.hdg_mode == "quick_alt" else PEAK_ALT_RATE_NORMAL_FPS
+                delta_alt = rate * factor * dt * self._alt_change_direction
                 if (self._alt_change_direction > 0 and self.alt_current + delta_alt >= self.alt_target) or \
                    (self._alt_change_direction < 0 and self.alt_current + delta_alt <= self.alt_target):
                     self.alt_current = self.alt_target
@@ -190,6 +191,8 @@ class Aircraft:
             self.alt_current = self.alt_target
             self.alt_change_progress = 1.0
             self._alt_change_direction = 0
+            if self.hdg_mode == "quick_alt":
+                self.hdg_mode = "normal"
 
         # 완료 체크
         if (abs(self.alt_current - self.alt_target) < 1

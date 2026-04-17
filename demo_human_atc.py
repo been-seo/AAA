@@ -48,7 +48,7 @@ from utils import render_text_with_simple_outline
 
 # ── 설정 ──
 MODEL_PATH = "models/world_model/best_model.pt"
-DREAMER_PATH = "models/dreamer/latest.pt"
+DREAMER_PATH = "models/dreamer/best.pt"
 PREDICTION_INTERVAL = 3.0
 CONFLICT_SCAN_INTERVAL = 5.0
 MC_SAMPLES_VIS = 20
@@ -350,7 +350,7 @@ def main():
     print("  Human ATC + AI Safety Advisory")
     print("  [N] Create aircraft  [I] Instruct selected")
     print("  [C] Deselect  [F] Follow  [A] ACK alert")
-    print("  [T] Assign scenario  [R] Refresh conflicts")
+    print("  [T] Scenario  [D] Quick Descent/Climb  [R] Refresh")
     print("  [1-3] Pred range  [SPACE] Pause AI  [ESC] Quit")
     print("=" * 55)
 
@@ -427,20 +427,46 @@ def main():
                         if related:
                             print(f"[ATC] ACK {len(related)} alerts for {cs}")
                 elif event.key == pygame.K_t:
+                    # 기존 항공기 전부 제거
+                    for old_ac in list(sim.user_aircraft):
+                        cs = old_ac.callsign
+                        if cs in scenarios:
+                            del scenarios[cs]
+                    sim.user_aircraft.clear()
+                    sim.selected_aircraft = None
+                    selected_icao = None
+
+                    # 시나리오용 항공기 생성: 랜덤 기지에서 출발
+                    from core.aircraft import Aircraft
+                    base = random.choice(MILITARY_AIRBASES)
+                    callsign = f"SCN{random.randint(10,99)}"
+                    alt = random.choice([15000, 20000, 25000])
+                    spd = random.choice([400, 420, 450])
+                    hdg = random.randint(0, 359)
+                    ac = Aircraft(base["lat"], base["lon"], callsign, hdg, alt, spd)
+                    sim.user_aircraft.append(ac)
+                    sim.selected_aircraft = ac
+                    selected_icao = f"USER_{callsign}"
+
                     # 시나리오 부여
-                    if sim.selected_aircraft and sim.selected_aircraft.is_user_controlled:
-                        sc = generate_scenario(sim.selected_aircraft)
-                        scenarios[sim.selected_aircraft.callsign] = sc
-                        advisor.set_scenario(sim.selected_aircraft.callsign, sc)
-                        wp = sc.current_waypoint
-                        if sc.type == "departure":
-                            print(f"[SCENARIO] DEPARTURE: {sc.origin['name']} -> {sc.destination['name']} (공역 진입 10NM)")
-                        else:
-                            print(f"[SCENARIO] ARRIVAL: {sc.origin['name']} -> {sc.destination['name']} (APP 인계 30NM, 7500-12500ft)")
-                        wlat, wlon, walt, wlabel = wp
-                        print(f"  Target: {wlabel} ({wlat:.2f}, {wlon:.2f}) FL{walt/100:.0f}")
+                    sc = generate_scenario(ac)
+                    scenarios[callsign] = sc
+                    advisor.set_scenario(callsign, sc)
+                    wp = sc.current_waypoint
+                    if sc.type == "departure":
+                        print(f"[SCENARIO] DEPARTURE: {callsign} @ {base['name']} -> {sc.destination['name']} (10NM)")
                     else:
-                        print("[ATC] Select a user-controlled aircraft first (press N to create)")
+                        print(f"[SCENARIO] ARRIVAL: {callsign} @ {base['name']} -> {sc.destination['name']} (APP 30NM)")
+                    wlat, wlon, walt, wlabel = wp
+                    print(f"  Target: {wlabel} ({wlat:.2f}, {wlon:.2f}) FL{walt/100:.0f}")
+                elif event.key == pygame.K_d:
+                    # Quick Descent/Climb: 선택 항공기 고도 ±5000ft 즉시 변경
+                    if sim.selected_aircraft and sim.selected_aircraft.is_user_controlled:
+                        ac = sim.selected_aircraft
+                        shift = -5000 if ac.alt_current > 10000 else 5000
+                        new_alt = max(2000, ac.alt_current + shift)
+                        ac.apply_instruction(ac.hdg_target, new_alt, ac.spd_target)
+                        print(f"[ATC] Quick {'Descent' if shift < 0 else 'Climb'}: {ac.callsign} -> FL{new_alt/100:.0f}")
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key == pygame.K_1:
@@ -588,15 +614,33 @@ def main():
         # ── Safety Advisor (통합: AI+룰 충돌탐지 + 위험도 + 경고) ──
         if sim.user_aircraft:
             advisor.update(sim.user_aircraft, all_tracked)
-            all_alerts = advisor.get_alerts(min_severity=Severity.CAUTION)
+            new_alerts = advisor.get_alerts(min_severity=Severity.CAUTION)
+            # 카테고리별 캐싱 (깜빡임 방지: 새 결과가 있을 때만 갱신)
+            new_conflict = [a for a in new_alerts if a.category == "CONFLICT"]
+            new_risk = [a for a in new_alerts if a.category == "AI_RISK"]
+            new_other = [a for a in new_alerts if a.category not in ("CONFLICT", "AI_RISK")]
+            if new_conflict or not hasattr(sim, '_prev_conflict'):
+                conflict_alerts = new_conflict
+            else:
+                conflict_alerts = getattr(sim, '_prev_conflict', [])
+            if new_risk or not hasattr(sim, '_prev_risk'):
+                risk_alerts = new_risk
+            else:
+                risk_alerts = getattr(sim, '_prev_risk', [])
+            if new_other or not hasattr(sim, '_prev_other'):
+                other_alerts = new_other
+            else:
+                other_alerts = getattr(sim, '_prev_other', [])
+            sim._prev_conflict = conflict_alerts
+            sim._prev_risk = risk_alerts
+            sim._prev_other = other_alerts
+            all_alerts = new_alerts
         else:
+            conflict_alerts = []
+            risk_alerts = []
+            other_alerts = []
             all_alerts = []
-
-        # alerts를 카테고리별 분리
-        conflict_alerts = [a for a in all_alerts if a.category == "CONFLICT"]
-        risk_alerts = [a for a in all_alerts if a.category == "AI_RISK"]
-        other_alerts = [a for a in all_alerts if a.category not in ("CONFLICT", "AI_RISK")]
-        alerts = all_alerts  # 전체 (HUD 카운트용)
+        alerts = all_alerts
 
         # ── AI 궤적 예측 (선택 항공기 시각화용) ──
         if not paused and selected_icao and selected_icao in all_tracked:
@@ -838,7 +882,7 @@ def main():
 
         # ── Conflict 패널 (우측 상단) ──
         sev_colors = {Severity.CAUTION: YELLOW, Severity.WARNING: ORANGE, Severity.ALERT: RED}
-        panel_w = 420
+        panel_w = 520
         panel_x = SCREEN_WIDTH - panel_w - 10
         panel_top = 10
 
@@ -856,7 +900,7 @@ def main():
                 s = font.render(f"[{alert.severity.name}] {alert.title}", True, col)
                 sim.screen.blit(s, (panel_x + 10, ay))
                 ay += 16
-                msg = alert.message[:52] + "..." if len(alert.message) > 52 else alert.message
+                msg = alert.message[:72] + "..." if len(alert.message) > 72 else alert.message
                 s = font.render(msg, True, (180, 180, 180))
                 sim.screen.blit(s, (panel_x + 15, ay))
                 ay += 22
@@ -868,7 +912,7 @@ def main():
 
         # ── AI Risk 패널 (우측 중간) ──
         if risk_alerts:
-            panel_h = min(len(risk_alerts[:5]) * 38 + 30, 250)
+            panel_h = min(len(risk_alerts[:5]) * 45 + 30, 300)
             bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
             bg.fill((0, 0, 0, 200))
             sim.screen.blit(bg, (panel_x, panel_top))
@@ -882,10 +926,10 @@ def main():
                 sim.screen.blit(s, (panel_x + 10, ay))
                 ay += 16
                 # 세부 요인 표시 (message에 SEP/CONV/ALT/SPD/AI 포함)
-                msg = alert.message[:56] + "..." if len(alert.message) > 56 else alert.message
+                msg = alert.message[:72] + "..." if len(alert.message) > 72 else alert.message
                 s = font.render(msg, True, (180, 180, 180))
                 sim.screen.blit(s, (panel_x + 15, ay))
-                ay += 20
+                ay += 26
                 click_rect = pygame.Rect(panel_x, item_y, panel_w, ay - item_y)
                 target = alert.aircraft_involved[0] if alert.aircraft_involved else None
                 if target:
@@ -908,7 +952,7 @@ def main():
                 s = font.render(f"[{alert.severity.name}] {alert.title}", True, col)
                 sim.screen.blit(s, (panel_x + 10, ay))
                 ay += 16
-                msg = alert.message[:52] + "..." if len(alert.message) > 52 else alert.message
+                msg = alert.message[:72] + "..." if len(alert.message) > 72 else alert.message
                 s = font.render(msg, True, (200, 200, 200))
                 sim.screen.blit(s, (panel_x + 15, ay))
                 ay += 22

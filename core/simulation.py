@@ -443,6 +443,8 @@ class Simulation:
                         self.selected_aircraft.apply_instruction(
                             float(msg["hdg"]), float(msg["alt"]), float(msg["spd"]),
                         )
+                        if msg.get("quick_alt"):
+                            self.selected_aircraft.hdg_mode = "quick_alt"
         except (EOFError, BrokenPipeError):
             pass
 
