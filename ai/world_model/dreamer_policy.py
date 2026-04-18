@@ -885,28 +885,24 @@ class DreamerTrainer:
         cert_h = sum(v**2 for v in critic_losses.values()) / len(critic_losses)
 
         # ── PAVING §8.9: task gradient 직교성 진단 ──
-        # (1) max |cos(adv_k, adv_l)|: paper 단위, threshold 0.5
-        # (2) gram_offdiag_ratio: Σ|off| / trace (보조 지표)
+        # max |cos(adv_k, adv_l)|: paper 단위, threshold τ=0.5
         max_cos_sim = 0.0
-        gram_offdiag_ratio = 0.0
         with torch.no_grad():
             axes_list = list(REWARD_AXES)
             norms = {ax: advs[ax].norm() for ax in axes_list}
-            G_diag = sum(advs[ax].var().item() for ax in axes_list)
-            G_off = 0.0
             for i in range(len(axes_list)):
                 for j in range(i+1, len(axes_list)):
                     dot = (advs[axes_list[i]] * advs[axes_list[j]]).sum()
                     denom = norms[axes_list[i]] * norms[axes_list[j]]
                     cos = (dot / denom.clamp(min=1e-8)).abs().item()
                     max_cos_sim = max(max_cos_sim, cos)
-                    G_off += abs(dot.item())
-            gram_offdiag_ratio = G_off / max(G_diag, 1e-8)
 
-            # CANON 위반 경고 (§8.9 threshold τ=0.5)
-            if max_cos_sim > 0.5:
-                print(f"[PAVING] CANON warning: max|cos|={max_cos_sim:.2f} (>0.5), "
-                      f"gram_offdiag={gram_offdiag_ratio:.2f}")
+        # CANON 위반 경고 (§8.9 τ=0.5, throttled)
+        if not hasattr(self, '_canon_warn_step'):
+            self._canon_warn_step = 0
+        if max_cos_sim > 0.5 and (self.total_episodes - self._canon_warn_step) > 10000:
+            self._canon_warn_step = self.total_episodes
+            print(f"[PAVING] CANON warning: max|cos|={max_cos_sim:.2f} (>0.5)")
 
         # Target critic soft update
         tau = 0.02
@@ -943,7 +939,6 @@ class DreamerTrainer:
             'r_efficiency': r_sums['efficiency'],
             'r_mission': r_sums['mission'],
             'certificate_h': cert_h,
-            'gram_offdiag': gram_offdiag_ratio,
             'max_cos_sim': max_cos_sim,
             'crashes': crashes,
             'entropy': entropy.item(),
