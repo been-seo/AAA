@@ -77,10 +77,15 @@ class TrajectoryPredictor(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # State encoder (입력 10D → sin/cos expand 14D → 128D)
-        # track_deg(idx4), wind_dir(idx8)을 sin/cos로 expand: 10 + 4 = 14
+        # State encoder (입력 10D → deg→sincos 치환 12D → 128D)
+        # track_deg(idx4), wind_dir(idx8)을 sin/cos로 치환 (원본 deg 제거)
+        # 10 - 2(deg) + 4(sin/cos) = 12D
+        self._track_mean = NORM_MEAN[4]  # 180
+        self._track_std = NORM_STD[4]    # 180
+        self._wind_mean = NORM_MEAN[8]   # 180
+        self._wind_std = NORM_STD[8]     # 180
         self.state_encoder = nn.Sequential(
-            nn.Linear(STATE_DIM + 4, 128),  # 14D input
+            nn.Linear(STATE_DIM - 2 + 4, 128),  # 12D input
             nn.ELU(),
             nn.Linear(128, 128),
             nn.ELU(),
@@ -125,23 +130,25 @@ class TrajectoryPredictor(nn.Module):
         self.register_buffer('norm_mean', torch.from_numpy(NORM_MEAN))
         self.register_buffer('norm_std', torch.from_numpy(NORM_STD))
 
-    @staticmethod
-    def _deg_to_sincos(state):
-        """모델 내부: deg 차원을 sin/cos로 expand. (B, 10) → (B, 14)
-        idx 4 (track_deg), idx 8 (wind_dir) → 각각 sin, cos 추가."""
-        track_rad = state[:, 4:5] * (3.14159265 / 180.0)
-        wind_rad = state[:, 8:9] * (3.14159265 / 180.0)
+    def _deg_to_sincos(self, state):
+        """모델 내부: 정규화된 deg → 원본 deg 복원 → sin/cos 치환. (B, 10) → (B, 12)
+        idx 4 (track_deg), idx 8 (wind_dir)를 sin/cos로 치환 (원본 deg 제거)."""
+        # 정규화된 값을 원본 deg로 복원
+        track_deg = state[:, 4:5] * self._track_std + self._track_mean
+        wind_deg = state[:, 8:9] * self._wind_std + self._wind_mean
+        track_rad = track_deg * (3.14159265 / 180.0)
+        wind_rad = wind_deg * (3.14159265 / 180.0)
         return torch.cat([
-            state[:, :4],                          # lat, lon, alt, gs
-            state[:, 4:5], torch.sin(track_rad), torch.cos(track_rad),  # track + sin/cos
-            state[:, 5:8],                          # vrate, ias, mach
-            state[:, 8:9], torch.sin(wind_rad), torch.cos(wind_rad),    # wind + sin/cos
-            state[:, 9:],                           # wind_spd
-        ], dim=-1)  # (B, 14)
+            state[:, :4],                                    # lat, lon, alt, gs
+            torch.sin(track_rad), torch.cos(track_rad),      # track sin/cos (원본 deg 제거)
+            state[:, 5:8],                                    # vrate, ias, mach
+            torch.sin(wind_rad), torch.cos(wind_rad),         # wind sin/cos (원본 deg 제거)
+            state[:, 9:],                                     # wind_spd
+        ], dim=-1)  # (B, 12)
 
     def _encode_state(self, state):
-        """state (B, STATE_DIM=10) → embedding (B, 128). 내부에서 sin/cos expand."""
-        expanded = self._deg_to_sincos(state)  # (B, 14)
+        """state (B, STATE_DIM=10) → embedding (B, 128). 내부에서 deg→sin/cos 치환."""
+        expanded = self._deg_to_sincos(state)  # (B, 12)
         return self.state_encoder(expanded)
 
     def _posterior(self, hidden, state_emb):
