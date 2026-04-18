@@ -180,16 +180,6 @@ def compute_reward_episode(own_state, traffic_states, action, device,
     r_alt_floor -= ((my_alt >= 2000) & (my_alt < 5000)).float() * 15
 
     # ══════════════════════════════════
-    #   Inner Task 4: evasion (돌발 대응)
-    #   주 feature: inject 여부 + 위험 상태 변화
-    # ══════════════════════════════════
-    r_evasion = torch.zeros(B, device=device)
-    evaded = prev_in_danger & injected & ~in_danger
-    r_evasion += evaded.float() * 40
-    preemptive = injected & ~in_danger & ~prev_in_danger
-    r_evasion += preemptive.float() * 10
-
-    # ══════════════════════════════════
     #   Inner Task 5: fuel (연료 소모율)
     #   주 feature: 속도
     # ══════════════════════════════════
@@ -272,11 +262,11 @@ def compute_reward_episode(own_state, traffic_states, action, device,
 
     # Inner tasks → Outer groups (합산)
     inner = {
-        'sep_h': r_sep_h, 'sep_v': r_sep_v, 'alt_floor': r_alt_floor, 'evasion': r_evasion,
+        'sep_h': r_sep_h, 'sep_v': r_sep_v, 'alt_floor': r_alt_floor,
         'fuel': r_fuel, 'direct': r_direct, 'progress': r_progress, 'alt_match': r_alt_match,
     }
     rewards = {
-        'safety': r_sep_h + r_sep_v + r_alt_floor + r_evasion,
+        'safety': r_sep_h + r_sep_v + r_alt_floor,
         'efficiency': r_fuel + r_direct,
         'mission': r_progress + r_alt_match,
     }
@@ -340,11 +330,11 @@ class Actor(nn.Module):
 
 # ── Inner Tasks (8개) → Outer Groups (3개) ──
 # 각 inner task는 서로 다른 상태 feature에 반응 → 자연 직교
-INNER_TASKS = ['sep_h', 'sep_v', 'alt_floor', 'evasion',  # safety group
-               'fuel', 'direct',                            # efficiency group
-               'progress', 'alt_match']                     # mission group
+INNER_TASKS = ['sep_h', 'sep_v', 'alt_floor',  # safety group (3)
+               'fuel', 'direct',                # efficiency group (2)
+               'progress', 'alt_match']          # mission group (2)
 TASK_GROUPS = {
-    'safety': ['sep_h', 'sep_v', 'alt_floor', 'evasion'],
+    'safety': ['sep_h', 'sep_v', 'alt_floor'],
     'efficiency': ['fuel', 'direct'],
     'mission': ['progress', 'alt_match'],
 }
@@ -414,6 +404,9 @@ class Critic(nn.Module):
         """Safety Advisor용: safety V → 위험도 [0,1].
         safety는 raw space: 0=안전, -100=RA충돌. sigmoid(-V * 0.05)로 변환.
           V=0 → 0.50, V=-20 → 0.73, V=-50 → 0.92, V=-100 → 0.99
+
+        TODO: 학습 후 held-out reliability diagram 기반 Platt/isotonic
+              보정으로 scale factor 0.05를 정당화해야 함.
         """
         with torch.no_grad():
             v = self.safety(own_state, traffic_states)

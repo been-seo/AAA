@@ -304,23 +304,21 @@ class TrajectoryPredictor(nn.Module):
         return kl.sum(dim=-1)  # (B,) — latent_dim 차원 합산
 
     def compute_loss(self, past_states, future_states, contexts, future_raw,
-                     kl_weight=0.1, free_nats=3.0):
+                     kl_weight=0.1, free_nats_per_step=1.0):
         """
         학습 손실 계산
 
         :param future_raw: (B, N, STATE_DIM) 비정규화된 미래 상태 (NM, ft 단위)
         :param kl_weight: KL 손실 가중치
-        :param free_nats: KL free nats (Dreamer-v3)
+        :param free_nats_per_step: KL free nats per timestep (DreamerV3 표준: 1.0)
         :return: dict with total_loss, recon_loss, kl_loss
         """
         output = self.forward(past_states, future_states, contexts)
 
-        # 미래 예측의 reconstruction loss (정규화 공간에서)
-        pred_mean = output['future_pred_mean']  # (B, N, D)
+        pred_mean = output['future_pred_mean']
         pred_logstd = output['future_pred_logstd']
 
-        # Gaussian NLL
-        target = future_states  # 정규화된 미래 상태
+        target = future_states
         var = (2 * pred_logstd).exp()
         nll = 0.5 * ((target - pred_mean).pow(2) / var + 2 * pred_logstd + math.log(2 * math.pi))
 
@@ -330,13 +328,16 @@ class TrajectoryPredictor(nn.Module):
         dim_weights[1] = 3.0  # lon
         dim_weights[2] = 2.0  # alt
         dim_weights[3] = 1.5  # gs
-        dim_weights[4] = 1.5  # track
+        dim_weights[4] = 1.5  # track_sin
+        dim_weights[5] = 1.5  # track_cos
 
         recon_loss = (nll * dim_weights).sum(dim=-1).mean()
 
-        # KL loss (free nats)
-        kl = output['kl_loss'].mean(dim=0).sum()  # 시퀀스 평균 → 타임스텝 합산
-        kl = torch.clamp(kl - free_nats, min=0)
+        # KL loss (free nats: T steps × per_step)
+        kl_per_step = output['kl_loss'].mean(dim=0)  # (T,)
+        T = kl_per_step.shape[0]
+        total_free_nats = free_nats_per_step * T
+        kl = torch.clamp(kl_per_step.sum() - total_free_nats, min=0)
 
         total_loss = recon_loss + kl_weight * kl
 

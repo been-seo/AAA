@@ -15,23 +15,49 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# 항공기 상태 벡터 구성 (10차원)
-STATE_DIM = 10
+# 항공기 상태 벡터 구성 (12차원)
+# track_deg, wind_direction_deg → sin/cos 쌍으로 분리 (0/360 wrap 해소)
+STATE_DIM = 12
 STATE_KEYS = [
     'lat', 'lon', 'baro_altitude_ft', 'ground_speed_kt',
-    'true_track_deg', 'vertical_rate_ft_min',
-    'ias_kt', 'mach', 'wind_direction_deg', 'wind_speed_kt',
+    'track_sin', 'track_cos', 'vertical_rate_ft_min',
+    'ias_kt', 'mach', 'wind_sin', 'wind_cos', 'wind_speed_kt',
 ]
 
-# DB 컬럼 → STATE_KEYS 매핑
+# DB 컬럼 (원본 10차원, 로드 후 sin/cos 변환)
 DB_COLUMNS = [
     'lat', 'lon', 'alt_baro', 'gs_kt',
     'track_deg', 'vrate_fpm', 'ias_kt', 'mach',
     'wind_dir', 'wind_spd',
 ]
+DB_STATE_DIM = 10  # DB에서 읽는 원본 차원
+DB_NORM_MEAN = np.array([36.0, 128.0, 25000, 400, 180, 0, 350, 0.75, 180, 20], dtype=np.float32)
 
-NORM_MEAN = np.array([36.0, 128.0, 25000, 400, 180, 0, 350, 0.75, 180, 20], dtype=np.float32)
-NORM_STD  = np.array([3.0,  3.0,  15000, 150, 180, 2000, 150, 0.25, 180, 30], dtype=np.float32)
+#                   lat   lon    alt     gs   trk_s trk_c  vrate  ias  mach  wnd_s wnd_c wnd_spd
+NORM_MEAN = np.array([36.0, 128.0, 25000, 400, 0,    0,     0,     350, 0.75, 0,    0,    20], dtype=np.float32)
+NORM_STD  = np.array([3.0,  3.0,  15000, 150, 1,    1,     2000,  150, 0.25, 1,    1,    30], dtype=np.float32)
+
+
+def _deg_to_sincos(states_10d):
+    """DB 원본 10차원 → sin/cos 변환 12차원"""
+    # states_10d: (..., 10)
+    shape = states_10d.shape[:-1]
+    out = np.zeros((*shape, STATE_DIM), dtype=np.float32)
+    out[..., 0] = states_10d[..., 0]   # lat
+    out[..., 1] = states_10d[..., 1]   # lon
+    out[..., 2] = states_10d[..., 2]   # alt
+    out[..., 3] = states_10d[..., 3]   # gs
+    track_rad = np.radians(states_10d[..., 4])
+    out[..., 4] = np.sin(track_rad)    # track_sin
+    out[..., 5] = np.cos(track_rad)    # track_cos
+    out[..., 6] = states_10d[..., 5]   # vrate
+    out[..., 7] = states_10d[..., 6]   # ias
+    out[..., 8] = states_10d[..., 7]   # mach
+    wind_rad = np.radians(states_10d[..., 8])
+    out[..., 9] = np.sin(wind_rad)     # wind_sin
+    out[..., 10] = np.cos(wind_rad)    # wind_cos
+    out[..., 11] = states_10d[..., 9]  # wind_spd
+    return out
 
 CONTEXT_DIM = 6
 MAX_NEIGHBORS = 8
@@ -75,14 +101,17 @@ def _get_neighbor_context(target_icao, target_state, ac_rows, max_n=MAX_NEIGHBOR
     return ctx
 
 
-def _interpolate_nans(states):
+def _interpolate_nans(states, fill_mean=None):
     """NaN 보간: 선형 보간 → 남은 NaN은 평균으로."""
+    D = states.shape[-1]
+    if fill_mean is None:
+        fill_mean = NORM_MEAN[:D] if D <= len(NORM_MEAN) else np.zeros(D)
     mask = ~np.isnan(states)
-    for dim in range(STATE_DIM):
+    for dim in range(D):
         col = states[:, dim]
         nans = np.isnan(col)
         if nans.all():
-            col[:] = NORM_MEAN[dim]
+            col[:] = fill_mean[dim] if dim < len(fill_mean) else 0.0
         elif nans.any():
             valid = ~nans
             col[nans] = np.interp(
@@ -218,7 +247,7 @@ class TrajectoryDataset(Dataset):
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
             cache_dir = os.path.normpath(cache_dir)
-        cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}.pt')
+        cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}_d{STATE_DIM}.pt')
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
         cached_n = 0
@@ -335,18 +364,28 @@ class TrajectoryDataset(Dataset):
             ORDER BY s.timestamp
         """, [icao] + window_sids).fetchall()
 
-        states = np.full((self.total_steps, STATE_DIM), np.nan, dtype=np.float32)
+        states_raw = np.full((self.total_steps, DB_STATE_DIM), np.nan, dtype=np.float32)
         sid_to_idx = {sid: i for i, sid in enumerate(window_sids)}
         for row in rows:
             sid = row[0]
             if sid in sid_to_idx:
                 i = sid_to_idx[sid]
-                for d in range(STATE_DIM):
+                for d in range(DB_STATE_DIM):
                     val = row[1 + d]
                     if val is not None:
-                        states[i, d] = float(val)
+                        states_raw[i, d] = float(val)
 
-        states, mask = _interpolate_nans(states)
+        states_raw, mask_raw = _interpolate_nans(states_raw, fill_mean=DB_NORM_MEAN)
+        # deg → sin/cos 변환 (10D → 12D)
+        states = _deg_to_sincos(states_raw)
+        mask = np.zeros((self.total_steps, STATE_DIM), dtype=np.float32)
+        # mask 확장: 원본 10D mask → 12D
+        mask[:, 0:4] = mask_raw[:, 0:4]
+        mask[:, 4:6] = mask_raw[:, 4:5]  # track → sin/cos 둘 다
+        mask[:, 6] = mask_raw[:, 5]       # vrate
+        mask[:, 7:9] = mask_raw[:, 6:8]   # ias, mach
+        mask[:, 9:11] = mask_raw[:, 8:9]  # wind → sin/cos 둘 다
+        mask[:, 11] = mask_raw[:, 9]      # wind_spd
 
         contexts = np.zeros((self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM),
                             dtype=np.float32)
