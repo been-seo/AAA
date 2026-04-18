@@ -276,7 +276,11 @@ class ConflictDetector:
         """
         MC, T, _ = traj_a.shape
 
-        # 각 Monte Carlo 샘플, 각 타임스텝에서의 분리 거리
+        # MC 샘플은 독립 생성이므로 인덱스 짝짓기에 의미 없음.
+        # 한쪽을 셔플하여 marginal product 분포에서 올바른 P(conflict) 추정.
+        shuffle_idx = np.random.permutation(MC)
+        traj_b = traj_b[shuffle_idx]
+
         lat_a, lon_a, alt_a = traj_a[:, :, 0], traj_a[:, :, 1], traj_a[:, :, 2]
         lat_b, lon_b, alt_b = traj_b[:, :, 0], traj_b[:, :, 1], traj_b[:, :, 2]
 
