@@ -13,7 +13,6 @@ Dreamer-style MBPO: World Model 안에서 관제를 "꿈꾸며" 학습
 tight vectoring은 안전하다는 것도 경험으로 학습.
 """
 import math
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -885,18 +884,29 @@ class DreamerTrainer:
         # Certificate h = (1/K) Σ L_k² — monotonic 감소 모니터링 (PAVING Eq.5)
         cert_h = sum(v**2 for v in critic_losses.values()) / len(critic_losses)
 
-        # Gradient 직교성 진단: Gram matrix 대각 우세도
-        # κ(G) ≈ 1이면 CANON 만족, >>1이면 task conflict
+        # ── PAVING §8.9: task gradient 직교성 진단 ──
+        # (1) max |cos(adv_k, adv_l)|: paper 단위, threshold 0.5
+        # (2) gram_offdiag_ratio: Σ|off| / trace (보조 지표)
+        max_cos_sim = 0.0
+        gram_offdiag_ratio = 0.0
         with torch.no_grad():
-            if len(advs) == 3:
-                G_diag = sum(advs[ax].var().item() for ax in REWARD_AXES)
-                G_off = 0.0
-                axes_list = list(REWARD_AXES)
-                for i in range(len(axes_list)):
-                    for j in range(i+1, len(axes_list)):
-                        corr = (advs[axes_list[i]] * advs[axes_list[j]]).mean().item()
-                        G_off += abs(corr)
-                kappa_approx = (G_diag + G_off) / max(G_diag, 1e-8)
+            axes_list = list(REWARD_AXES)
+            norms = {ax: advs[ax].norm() for ax in axes_list}
+            G_diag = sum(advs[ax].var().item() for ax in axes_list)
+            G_off = 0.0
+            for i in range(len(axes_list)):
+                for j in range(i+1, len(axes_list)):
+                    dot = (advs[axes_list[i]] * advs[axes_list[j]]).sum()
+                    denom = norms[axes_list[i]] * norms[axes_list[j]]
+                    cos = (dot / denom.clamp(min=1e-8)).abs().item()
+                    max_cos_sim = max(max_cos_sim, cos)
+                    G_off += abs(dot.item())
+            gram_offdiag_ratio = G_off / max(G_diag, 1e-8)
+
+            # CANON 위반 경고 (§8.9 threshold τ=0.5)
+            if max_cos_sim > 0.5:
+                print(f"[PAVING] CANON warning: max|cos|={max_cos_sim:.2f} (>0.5), "
+                      f"gram_offdiag={gram_offdiag_ratio:.2f}")
 
         # Target critic soft update
         tau = 0.02
@@ -933,7 +943,8 @@ class DreamerTrainer:
             'r_efficiency': r_sums['efficiency'],
             'r_mission': r_sums['mission'],
             'certificate_h': cert_h,
-            'kappa': kappa_approx,
+            'gram_offdiag': gram_offdiag_ratio,
+            'max_cos_sim': max_cos_sim,
             'crashes': crashes,
             'entropy': entropy.item(),
         }

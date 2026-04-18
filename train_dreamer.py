@@ -209,12 +209,12 @@ def main():
             crash_rate = (trainer.total_crashes / max(trainer.total_episodes, 1)) * 100
             vs = f"V=[S{metrics.get('v_safety',0):.1f}/E{metrics.get('v_efficiency',0):.1f}/M{metrics.get('v_mission',0):.1f}]"
             rs = f"R=[S{metrics.get('r_safety',0):.1f}/E{metrics.get('r_efficiency',0):.1f}/M{metrics.get('r_mission',0):.1f}]"
-            kappa = metrics.get('kappa', 0)
+            cos = metrics.get('max_cos_sim', 0)
             cert = metrics.get('certificate_h', 0)
             print(f"[{step:6d}] {vs} {rs} "
                   f"crash={metrics['crashes']} "
                   f"ent={metrics['entropy']:.3f} "
-                  f"k={kappa:.2f} h={cert:.1f} "
+                  f"cos={cos:.2f} h={cert:.1f} "
                   f"| {trainer.total_episodes}ep "
                   f"{crash_rate:.1f}%")
 
