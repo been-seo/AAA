@@ -176,8 +176,9 @@ def main():
         # Dreamer train step
         try:
             metrics = trainer.train_step(past_states, past_contexts)
-        except Exception as e:
-            print(f"[Dreamer] Step {step} error: {e}")
+        except (RuntimeError, ValueError) as e:
+            # CUDA OOM, NaN 등 복구 가능한 에러만 잡음
+            print(f"[Dreamer] Step {step} error: {type(e).__name__}: {e}")
             step += 1
             continue
 
@@ -206,14 +207,14 @@ def main():
             db.commit()
 
             crash_rate = (trainer.total_crashes / max(trainer.total_episodes, 1)) * 100
-            # 3축 가중치 표시
-            ws = f"w=[S{metrics.get('w_safety',0):.0%}/E{metrics.get('w_efficiency',0):.0%}/M{metrics.get('w_mission',0):.0%}]"
             vs = f"V=[S{metrics.get('v_safety',0):.1f}/E{metrics.get('v_efficiency',0):.1f}/M{metrics.get('v_mission',0):.1f}]"
-            print(f"[{step:6d}] R={metrics['mean_reward']:8.1f} "
-                  f"{vs} "
+            rs = f"R=[S{metrics.get('r_safety',0):.1f}/E{metrics.get('r_efficiency',0):.1f}/M{metrics.get('r_mission',0):.1f}]"
+            kappa = metrics.get('kappa', 0)
+            cert = metrics.get('certificate_h', 0)
+            print(f"[{step:6d}] {vs} {rs} "
                   f"crash={metrics['crashes']} "
                   f"ent={metrics['entropy']:.3f} "
-                  f"{ws} "
+                  f"k={kappa:.2f} h={cert:.1f} "
                   f"| {trainer.total_episodes}ep "
                   f"{crash_rate:.1f}%")
 

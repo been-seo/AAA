@@ -13,6 +13,7 @@ Dreamer-style MBPO: World Model 안에서 관제를 "꿈꾸며" 학습
 tight vectoring은 안전하다는 것도 경험으로 학습.
 """
 import math
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -848,26 +849,20 @@ class DreamerTrainer:
                 torch.nn.utils.clip_grad_norm_(self.critic.heads[ax].parameters(), 1.0)
                 self.critic_opts[ax].step()
 
-        # ── GAN-style 가중치: 못하는 축이 더 강하게 당김 ──
-        with torch.no_grad():
-            losses = torch.tensor([critic_losses[ax] for ax in REWARD_AXES], device=self.device)
-            losses = losses.clamp(min=0.1)
-            # 높은 loss = 못하는 축 = 더 높은 가중치
-            weights = losses / losses.sum()
-            # 고정 가중치: safety 50%, efficiency 25%, mission 25%
-            w_dict = {'safety': 0.50, 'efficiency': 0.25, 'mission': 0.25}
-            # 정규화
-            total = sum(w_dict.values())
-            w_dict = {ax: v / total for ax, v in w_dict.items()}
+        # PAVING: 가중치 없이 φ = ΣL_k 합산. Inner task 직교성이 보장하면 conflict 없음.
+        w_dict = {'safety': 1.0/3, 'efficiency': 1.0/3, 'mission': 1.0/3}  # 균등 (로깅용)
 
-        # ── Actor 업데이트: PCGrad + certificate monitoring (PAVING) ──
+        # ── Actor 업데이트: PAVING (φ = ΣL_k 단순 합산) ──
+        # Inner task가 직교하면 gradient conflict 없음 (CANON, Remark 1)
         logits = self.actor(own_flat, traffic_flat)
         logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
         dist = torch.distributions.Categorical(logits=logits)
         actions_flat = rollout['actions'].reshape(B * H)
         log_probs = dist.log_prob(actions_flat)
+        entropy = dist.entropy().mean()
 
-        # 축별 advantage 계산
+        # 축별 advantage → 단순 합산 (φ-flow)
+        total_advantage = torch.zeros(B * H, device=self.device)
         advs = {}
         for ax in REWARD_AXES:
             with torch.no_grad():
@@ -877,57 +872,31 @@ class DreamerTrainer:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             adv = adv.clamp(-5, 5)
             advs[ax] = adv
+            total_advantage += adv  # PAVING: 가중치 없이 합산
 
-        # PCGrad: 축별 gradient를 계산하고 충돌 시 projection
-        self.actor_opt.zero_grad()
-        task_grads = {}
-        entropy = dist.entropy().mean()
+        actor_loss = -(log_probs * total_advantage).mean() - 0.03 * entropy
 
-        for ax in REWARD_AXES:
-            task_loss = -(log_probs * advs[ax] * w_dict[ax]).mean() - 0.01 * entropy
-            if torch.isfinite(task_loss):
-                task_loss.backward(retain_graph=True)
-                # 현재 gradient 저장
-                grad = []
-                for p in self.actor.parameters():
-                    if p.grad is not None:
-                        grad.append(p.grad.clone().flatten())
-                    else:
-                        grad.append(torch.zeros(p.numel(), device=self.device))
-                task_grads[ax] = torch.cat(grad)
-                self.actor_opt.zero_grad()
-
-        # Gradient projection: 충돌하는 gradient 성분 제거
-        if len(task_grads) == len(REWARD_AXES):
-            projected = {}
-            axes = list(REWARD_AXES)
-            for i, ax in enumerate(axes):
-                g = task_grads[ax].clone()
-                for j, other in enumerate(axes):
-                    if i == j:
-                        continue
-                    g_other = task_grads[other]
-                    dot = (g * g_other).sum()
-                    if dot < 0:  # 충돌하면 projection
-                        g = g - dot / (g_other.norm() ** 2 + 1e-8) * g_other
-                projected[ax] = g
-
-            # Projected gradient 합산 → Actor에 적용
-            final_grad = sum(projected.values())
-            idx = 0
-            for p in self.actor.parameters():
-                numel = p.numel()
-                if p.grad is None:
-                    p.grad = final_grad[idx:idx+numel].reshape(p.shape)
-                else:
-                    p.grad.copy_(final_grad[idx:idx+numel].reshape(p.shape))
-                idx += numel
-
+        if torch.isfinite(actor_loss):
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
 
-        # Certificate h = (1/K) Σ critic_loss_k² (PAVING)
+        # Certificate h = (1/K) Σ L_k² — monotonic 감소 모니터링 (PAVING Eq.5)
         cert_h = sum(v**2 for v in critic_losses.values()) / len(critic_losses)
+
+        # Gradient 직교성 진단: Gram matrix 대각 우세도
+        # κ(G) ≈ 1이면 CANON 만족, >>1이면 task conflict
+        with torch.no_grad():
+            if len(advs) == 3:
+                G_diag = sum(advs[ax].var().item() for ax in REWARD_AXES)
+                G_off = 0.0
+                axes_list = list(REWARD_AXES)
+                for i in range(len(axes_list)):
+                    for j in range(i+1, len(axes_list)):
+                        corr = (advs[axes_list[i]] * advs[axes_list[j]]).mean().item()
+                        G_off += abs(corr)
+                kappa_approx = (G_diag + G_off) / max(G_diag, 1e-8)
 
         # Target critic soft update
         tau = 0.02
@@ -964,6 +933,7 @@ class DreamerTrainer:
             'r_efficiency': r_sums['efficiency'],
             'r_mission': r_sums['mission'],
             'certificate_h': cert_h,
+            'kappa': kappa_approx,
             'crashes': crashes,
             'entropy': entropy.item(),
         }

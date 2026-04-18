@@ -72,7 +72,7 @@ TCAS_SL_TABLE = [
 
 # ── RL 환경 ──
 RL_SIM_STEP_SEC = 5.0
-RL_ACTION_COUNT = 7201       # 7200 조합 + 1 (유지)
+# RL_ACTION_COUNT는 dreamer_policy.py의 NUM_ACTIONS에서 동적 계산
 RL_MAX_TRAFFIC_OBS = 5
 RL_OBS_DIM = 10 + 6 * 5     # 기본 10 + 주변항공기 30 = 40
 
