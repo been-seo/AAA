@@ -1,16 +1,16 @@
 # AAA — AI Avoidance Advisor
 
-항공관제 환경에서 충돌 위험을 예측하고, 통제사에게 선제적 회피 자문을 제공하는 AI 안전 자문 시스템.
+항공관제 환경에서 충돌 위험을 예측하고, 통제사에게 선제적 회피 자문을 제공하는 AI 안전 자문 시스템. 본 시스템은 advisory tool이며, 모든 권고는 비강제적이다.
 
 ## Overview
 
-AAA는 확률적 궤적 예측(World Model)과 다목적 강화학습 위험도 평가(Dreamer MBPO + PAVING)를 결합하여, 규칙 기반 경고의 한계를 넘는 지능형 안전 자문을 실현한다.
+AAA는 확률적 궤적 예측(World Model: GRU + VAE + Attention)과 다목적 강화학습 위험도 평가(Dreamer MBPO + PAVING φ-flow)를 결합하여, 규칙 기반 경고의 한계를 넘는 지능형 안전 자문을 실현한다.
 
 ### 핵심 기능
 
-- **확률적 충돌 예측**: Transformer + VAE 기반 World Model이 Monte Carlo 샘플링으로 미래 궤적을 예측하고, 충돌 확률을 정량화
-- **8 Inner Task 다목적 학습**: PAVING 프레임워크 기반 직교 태스크 분해. 안전(수평분리/수직분리/고도/회피), 효율(연료/경로), 임무(진행/고도매칭) 8개 inner task를 직교 설계하여 gradient conflict 없이 동시 학습
-- **AI + 룰 이중 안전망**: World Model 기반 AI 탐지(주)와 closing rate 기반 룰 탐지(보조)를 병행. 속도 기반 스캔 범위 자동 조정
+- **확률적 충돌 예측**: GRU 시퀀스 모델 + VAE 확률적 잠재 변수 + Attention 기반 항공기 상호작용. Monte Carlo 샘플링으로 충돌 확률 정량화. MC 샘플 간 독립성 보장(한쪽 셔플)
+- **8 Inner Task 다목적 학습**: PAVING 프레임워크 기반 태스크 분해. 안전(수평분리/수직분리/고도/회피), 효율(연료/경로), 임무(진행/고도매칭). φ-flow 단순 합산으로 학습, max|cos| 진단으로 직교성 실시간 모니터링(§8.9)
+- **AI + 룰 이중 안전망**: World Model 기반 AI 탐지(주)와 closing rate 기반 룰 탐지(보조). 속도 기반 스캔 범위 자동 조정
 - **ACK 기반 경고 관리**: 경고 발행 → 통제사 확인(ACK) → 동일 이벤트 억제. 비상 경고는 상황 해소 시에만 소멸
 - **Human-in-the-loop 데모**: 통제사가 직접 항공기를 생성·관제하며 AI 경고를 실시간 확인
 
@@ -22,7 +22,7 @@ AAA는 확률적 궤적 예측(World Model)과 다목적 강화학습 위험도 
     ▼
 Simulation Engine ─── Flight Plan Extractor
     │
-    ├──▶ World Model (궤적 예측, 충돌 확률)
+    ├──▶ World Model (GRU+VAE+Attn, 궤적 예측, 충돌 확률)
     ├──▶ Dreamer MBPO (8 inner task, PAVING φ-flow)
     │       Safety:  sep_h, sep_v, alt_floor, evasion
     │       Efficiency: fuel, direct
@@ -39,13 +39,14 @@ Simulation Engine ─── Flight Plan Extractor
 ### 학습 파이프라인
 
 ```
-녹화 데이터 → World Model 학습 (정상 항적 패턴)
+녹화 데이터 → World Model 학습 (GRU+VAE, 정상 항적 패턴)
            → Dreamer MBPO:
              에피소드 = 실제 트래픽 속에서 내 항공기 1대 관제
-             8 inner task 직교 보상 (PAVING CANON)
-             certificate h 모니터링, κ(G) 직교성 진단
+             8 inner task 보상 → φ = ΣL_k 합산 (PAVING CANON)
+             max|cos(∇L_k, ∇L_l)| 모니터링 (§8.9, τ=0.5)
+             certificate h monotonic 감소 확인
              Event Injector (돌발 상황 주입)
-           → 체크포인트 배포
+           → 체크포인트 배포 (ONNX/TensorRT 변환 가능)
 ```
 
 ## Installation
@@ -118,14 +119,14 @@ AAA/
 ├── ai/                      # AI 모듈
 │   ├── safety_advisor.py    # 통합 경고 (AI+룰, ACK, 3축 위험도)
 │   └── world_model/
-│       ├── trajectory_predictor.py  # Transformer + VAE
+│       ├── trajectory_predictor.py  # GRU + VAE + Attention
 │       ├── dataset.py               # DB → 텐서 (증분 캐시)
 │       ├── trainer.py               # World Model 학습
 │       ├── dreamer_policy.py        # 8 inner task, PAVING φ-flow
-│       └── conflict_detector.py     # MC 충돌 확률
+│       └── conflict_detector.py     # MC 충돌 확률 (셔플 pairing)
 │
 ├── gui/
-│   └── control_panel.py     # PyQt5 관제 패널 (Quick ALT 지원)
+│   └── control_panel.py     # PyQt5 관제 패널 (Quick ALT)
 │
 └── utils/
     ├── geo.py               # haversine, bearing
@@ -153,16 +154,16 @@ AAA/
 | Safety | sep_v | alt 차이 | <500ft -50, <1000ft -20 |
 | Safety | alt_floor | 절대 고도 | <2000ft -60 |
 | Safety | evasion | inject 상태변화 | 회피성공 +40 |
-| Efficiency | fuel | 속도 | -gs/600 per step |
+| Efficiency | fuel | 속도, 진행도 | -gs/600 + progress |
 | Efficiency | direct | hdg vs 목적지 방위 | cos(err) × 2 |
 | Mission | progress | 거리 변화 | ±3/NM, 도달 +100 |
 | Mission | alt_match | alt vs 목표 | 근접 시 -alt_err×2 |
 
 ### PAVING Framework
 
-- **φ-flow**: `φ = ΣL_k` 단순 합산. Inner task 직교성이 보장하면 gradient conflict 없이 모든 task 동시 개선
+- **φ-flow**: `φ = ΣL_k` 단순 합산. Inner task 직교성 하에서 gradient conflict 없이 모든 task 동시 개선 (CANON, Remark 1)
+- **max|cos(∇L_k, ∇L_l)|**: §8.9 진단 metric. τ=0.5 초과 시 CANON 위반 경고
 - **Certificate h**: `(1/K)Σ L_k²` monotonic 감소 모니터링
-- **κ(G)**: Gram matrix 대각 우세도. κ≈1이면 CANON 만족
 
 ## References
 
