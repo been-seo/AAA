@@ -77,9 +77,10 @@ class TrajectoryPredictor(nn.Module):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
-        # State encoder
+        # State encoder (입력 10D → sin/cos expand 14D → 128D)
+        # track_deg(idx4), wind_dir(idx8)을 sin/cos로 expand: 10 + 4 = 14
         self.state_encoder = nn.Sequential(
-            nn.Linear(STATE_DIM, 128),
+            nn.Linear(STATE_DIM + 4, 128),  # 14D input
             nn.ELU(),
             nn.Linear(128, 128),
             nn.ELU(),
@@ -124,9 +125,24 @@ class TrajectoryPredictor(nn.Module):
         self.register_buffer('norm_mean', torch.from_numpy(NORM_MEAN))
         self.register_buffer('norm_std', torch.from_numpy(NORM_STD))
 
+    @staticmethod
+    def _deg_to_sincos(state):
+        """모델 내부: deg 차원을 sin/cos로 expand. (B, 10) → (B, 14)
+        idx 4 (track_deg), idx 8 (wind_dir) → 각각 sin, cos 추가."""
+        track_rad = state[:, 4:5] * (3.14159265 / 180.0)
+        wind_rad = state[:, 8:9] * (3.14159265 / 180.0)
+        return torch.cat([
+            state[:, :4],                          # lat, lon, alt, gs
+            state[:, 4:5], torch.sin(track_rad), torch.cos(track_rad),  # track + sin/cos
+            state[:, 5:8],                          # vrate, ias, mach
+            state[:, 8:9], torch.sin(wind_rad), torch.cos(wind_rad),    # wind + sin/cos
+            state[:, 9:],                           # wind_spd
+        ], dim=-1)  # (B, 14)
+
     def _encode_state(self, state):
-        """state (B, STATE_DIM) → embedding (B, 128)"""
-        return self.state_encoder(state)
+        """state (B, STATE_DIM=10) → embedding (B, 128). 내부에서 sin/cos expand."""
+        expanded = self._deg_to_sincos(state)  # (B, 14)
+        return self.state_encoder(expanded)
 
     def _posterior(self, hidden, state_emb):
         """Posterior q(z|h, x): 관측이 있을 때의 latent"""
@@ -328,8 +344,7 @@ class TrajectoryPredictor(nn.Module):
         dim_weights[1] = 3.0  # lon
         dim_weights[2] = 2.0  # alt
         dim_weights[3] = 1.5  # gs
-        dim_weights[4] = 1.5  # track_sin
-        dim_weights[5] = 1.5  # track_cos
+        dim_weights[4] = 1.5  # track
 
         recon_loss = (nll * dim_weights).sum(dim=-1).mean()
 
