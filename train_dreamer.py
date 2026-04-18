@@ -44,6 +44,13 @@ def create_db_logger(db_path):
             total_safe INTEGER
         )
     """)
+    # 축별 컬럼 추가 (기존 DB 호환)
+    for col in ['v_safety', 'v_efficiency', 'v_mission', 'w_safety', 'w_efficiency', 'w_mission',
+                 'r_safety', 'r_efficiency', 'r_mission']:
+        try:
+            conn.execute(f"ALTER TABLE dreamer_steps ADD COLUMN {col} REAL DEFAULT 0")
+        except Exception:
+            pass  # 이미 존재
     conn.commit()
     return conn
 
@@ -179,13 +186,23 @@ def main():
         # 로깅
         if step % args.log_interval == 0:
             db.execute(
-                "INSERT OR REPLACE INTO dreamer_steps VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT OR REPLACE INTO dreamer_steps
+                   (step, timestamp, actor_loss, critic_loss, mean_reward, mean_value,
+                    crashes, entropy, total_episodes, total_crashes, total_safe,
+                    v_safety, v_efficiency, v_mission, w_safety, w_efficiency, w_mission,
+                    r_safety, r_efficiency, r_mission)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (step, time.time(),
                  metrics['actor_loss'], metrics['critic_loss'],
                  metrics['mean_reward'], metrics['mean_value'],
                  metrics['crashes'], metrics['entropy'],
                  trainer.total_episodes, trainer.total_crashes,
-                 trainer.total_safe))
+                 trainer.total_safe,
+                 metrics.get('v_safety', 0), metrics.get('v_efficiency', 0),
+                 metrics.get('v_mission', 0), metrics.get('w_safety', 0),
+                 metrics.get('w_efficiency', 0), metrics.get('w_mission', 0),
+                 metrics.get('r_safety', 0), metrics.get('r_efficiency', 0),
+                 metrics.get('r_mission', 0)))
             db.commit()
 
             crash_rate = (trainer.total_crashes / max(trainer.total_episodes, 1)) * 100

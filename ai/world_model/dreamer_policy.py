@@ -104,7 +104,8 @@ def _build_action_table(device):
 
 def compute_reward_episode(own_state, traffic_states, action, device,
                            dest_lat=None, dest_lon=None, dest_alt=None,
-                           prev_dist=None, is_arrival=None,
+                           prev_dist=None, init_dist=None, is_arrival=None,
+                           is_terminal=None, fuel_remaining=None,
                            injected=None, prev_in_danger=None):
     """
     에피소드 기반 보상 계산: 내 항공기(own) vs 주변 트래픽(traffic).
@@ -151,34 +152,69 @@ def compute_reward_episode(own_state, traffic_states, action, device,
     in_danger = has_ra | has_ta
 
     # ══════════════════════════════════
-    #   축 1: SAFETY
+    #   Inner Task 1: sep_h (수평 분리)
+    #   주 feature: lat/lon 상대 거리
     # ══════════════════════════════════
-    r_safety = torch.zeros(B, device=device)
-    r_safety -= has_ra.float() * 100
-    r_safety -= has_ta.float() * 30
+    r_sep_h = torch.zeros(B, device=device)
+    r_sep_h -= has_ra.float() * 100
+    r_sep_h -= has_ta.float() * 30
     self_caused = in_danger & ~injected
-    r_safety -= self_caused.float() * 60
+    r_sep_h -= self_caused.float() * 60
+
+    # ══════════════════════════════════
+    #   Inner Task 2: sep_v (수직 분리)
+    #   주 feature: alt 차이
+    # ══════════════════════════════════
+    r_sep_v = torch.zeros(B, device=device)
+    # 가장 가까운 트래픽과의 수직 분리
+    min_v_dist = v_dist.min(dim=1).values  # (B,)
+    r_sep_v -= (min_v_dist < 500).float() * 50   # 500ft 미만: 위험
+    r_sep_v -= ((min_v_dist >= 500) & (min_v_dist < 1000)).float() * 20
+
+    # ══════════════════════════════════
+    #   Inner Task 3: alt_floor (최저안전고도)
+    #   주 feature: 절대 고도
+    # ══════════════════════════════════
+    r_alt_floor = torch.zeros(B, device=device)
+    r_alt_floor -= (my_alt < 2000).float() * 60
+    r_alt_floor -= ((my_alt >= 2000) & (my_alt < 5000)).float() * 15
+
+    # ══════════════════════════════════
+    #   Inner Task 4: evasion (돌발 대응)
+    #   주 feature: inject 여부 + 위험 상태 변화
+    # ══════════════════════════════════
+    r_evasion = torch.zeros(B, device=device)
     evaded = prev_in_danger & injected & ~in_danger
-    r_safety += evaded.float() * 40
+    r_evasion += evaded.float() * 40
     preemptive = injected & ~in_danger & ~prev_in_danger
-    r_safety += preemptive.float() * 10
-    r_safety -= (my_alt < 2000).float() * 60
-    r_safety -= ((my_alt >= 2000) & (my_alt < 5000)).float() * 15
+    r_evasion += preemptive.float() * 10
 
     # ══════════════════════════════════
-    #   축 2: EFFICIENCY
+    #   Inner Task 5: fuel (연료 소모율)
+    #   주 feature: 속도
     # ══════════════════════════════════
-    r_efficiency = torch.zeros(B, device=device)
-    r_efficiency -= my_gs / 600.0
-    r_efficiency -= (my_gs < 150).float() * 10
-    r_efficiency -= (my_gs > 600).float() * 5
+    r_fuel = torch.zeros(B, device=device)
+    r_fuel -= my_gs / 600.0
 
     # ══════════════════════════════════
-    #   축 3: MISSION
+    #   Inner Task 6: direct (경로 직진성)
+    #   주 feature: heading vs 목적지 방위 차이
     # ══════════════════════════════════
-    r_mission = torch.zeros(B, device=device)
+    r_direct = torch.zeros(B, device=device)
 
-    # ── 목적지 (mission 축) ──
+    # ══════════════════════════════════
+    #   Inner Task 7: progress (목적지 접근)
+    #   주 feature: 거리 변화량
+    # ══════════════════════════════════
+    r_progress = torch.zeros(B, device=device)
+
+    # ══════════════════════════════════
+    #   Inner Task 8: alt_match (도착 고도 매칭)
+    #   주 feature: 고도 vs 목표 고도 차이
+    # ══════════════════════════════════
+    r_alt_match = torch.zeros(B, device=device)
+
+    # ── 목적지 관련 inner tasks ──
     cur_dist = None
     if dest_lat is not None:
         d_dlat = (my_lat - dest_lat) * 60.0
@@ -186,24 +222,69 @@ def compute_reward_episode(own_state, traffic_states, action, device,
         d_dlon = (my_lon - dest_lon) * 60.0 * d_cos
         cur_dist = torch.sqrt(d_dlat**2 + d_dlon**2)
 
+        # direct: heading이 목적지 방향과 얼마나 정렬됐는지
+        dest_bearing = torch.atan2(d_dlon, d_dlat) * 180 / 3.14159  # 대략적 방위
+        hdg_diff = ((my_gs * 0 + own_state[:, 4]) - dest_bearing + 180) % 360 - 180  # hdg vs bearing
+        alignment = torch.cos(hdg_diff * 3.14159 / 180)  # 1=정렬, -1=역방향
+        r_direct += alignment * 2.0  # 정렬 보너스
+
+        # progress: 거리 변화
         if prev_dist is not None:
-            regress = (cur_dist - prev_dist).clamp(min=0)
-            r_mission -= regress * 0.5
-            r_efficiency -= regress * 0.2
+            progress = (prev_dist - cur_dist).clamp(-5, 5)
+            r_progress += progress * 3.0
+            r_fuel += progress * 1.0  # 가까워지면 연료비 정당화
 
-        if is_arrival is not None:
-            arr_complete = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM) & \
-                           (my_alt >= _APP_HANDOFF_ALT_MIN) & (my_alt <= _APP_HANDOFF_ALT_MAX)
-            r_mission += arr_complete.float() * 100.0
+        # alt_match: 목적지 고도 매칭
+        if is_arrival is not None and dest_alt is not None:
+            target_alt = torch.where(is_arrival,
+                torch.tensor(10000.0, device=device),
+                dest_alt if dest_alt is not None else torch.tensor(20000.0, device=device))
+            alt_err = torch.abs(my_alt - target_alt) / 1000.0  # kft 단위
+            # 가까울수록 보상 (30NM 이내일 때만)
+            if cur_dist is not None:
+                near_dest = cur_dist < 50.0
+                r_alt_match -= near_dest.float() * alt_err.clamp(0, 10) * 2.0
 
-            arr_close = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM)
-            arr_alt_bad = arr_close & ((my_alt < _APP_HANDOFF_ALT_MIN) | (my_alt > _APP_HANDOFF_ALT_MAX))
-            r_mission -= arr_alt_bad.float() * 3.0
+        # 터미널 평가
+        if is_terminal is not None and is_arrival is not None:
+            arr_reached = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM) & \
+                          (my_alt >= _APP_HANDOFF_ALT_MIN) & (my_alt <= _APP_HANDOFF_ALT_MAX)
+            dep_reached = ~is_arrival & (cur_dist < 10.0)
+            reached = arr_reached | dep_reached
 
-            dep_complete = ~is_arrival & (cur_dist < 10.0)
-            r_mission += dep_complete.float() * 80.0
+            fuel_frac = fuel_remaining.clamp(0, 1) if fuel_remaining is not None else torch.ones(B, device=device)
 
-    rewards = {'safety': r_safety, 'efficiency': r_efficiency, 'mission': r_mission}
+            # 도달: progress + fuel 보너스
+            r_progress += (reached & is_terminal).float() * 100.0
+            r_fuel += (reached & is_terminal).float() * fuel_frac * 50.0
+
+            # 미도달: progress 패널티
+            not_reached_terminal = ~reached & is_terminal
+            if init_dist is not None:
+                dist_frac = (cur_dist / init_dist.clamp(min=1.0)).clamp(0, 2)
+            else:
+                dist_frac = torch.ones(B, device=device)
+            r_progress -= not_reached_terminal.float() * dist_frac * 50.0
+
+            if fuel_remaining is not None:
+                fuel_empty = (fuel_remaining <= 0) & is_terminal
+                r_fuel -= fuel_empty.float() * 80.0
+
+    # Inner tasks → Outer groups (합산)
+    inner = {
+        'sep_h': r_sep_h, 'sep_v': r_sep_v, 'alt_floor': r_alt_floor, 'evasion': r_evasion,
+        'fuel': r_fuel, 'direct': r_direct, 'progress': r_progress, 'alt_match': r_alt_match,
+    }
+    rewards = {
+        'safety': r_sep_h + r_sep_v + r_alt_floor + r_evasion,
+        'efficiency': r_fuel + r_direct,
+        'mission': r_progress + r_alt_match,
+    }
+    rewards['_inner'] = inner  # 로깅/디버깅용
+    # Certificate h = (1/K) Σ L_k² (PAVING 논문)
+    inner_vals = torch.stack(list(inner.values()), dim=0)  # (8, B)
+    rewards['_certificate'] = (inner_vals ** 2).mean(dim=0)  # (B,)
+
     return rewards, cur_dist, in_danger
 
 
@@ -257,7 +338,17 @@ class Actor(nn.Module):
 # Actor는 세 축의 균형점(파레토 최적)을 찾아야 함.
 # 각 Critic의 출력 = 해당 축의 점수 → demo에서 세부 요인 표시에 직접 사용.
 
-REWARD_AXES = ['safety', 'efficiency', 'mission']
+# ── Inner Tasks (8개) → Outer Groups (3개) ──
+# 각 inner task는 서로 다른 상태 feature에 반응 → 자연 직교
+INNER_TASKS = ['sep_h', 'sep_v', 'alt_floor', 'evasion',  # safety group
+               'fuel', 'direct',                            # efficiency group
+               'progress', 'alt_match']                     # mission group
+TASK_GROUPS = {
+    'safety': ['sep_h', 'sep_v', 'alt_floor', 'evasion'],
+    'efficiency': ['fuel', 'direct'],
+    'mission': ['progress', 'alt_match'],
+}
+REWARD_AXES = ['safety', 'efficiency', 'mission']  # 외부 호환용 유지
 
 class _CriticHead(nn.Module):
     """단일 축의 Value Function"""
@@ -568,10 +659,14 @@ class DreamerTrainer:
         # Imagination rollout
         all_states = [current_own_raw]
         all_actions = []
-        all_traffic = []  # 매 스텝 트래픽 저장 (Critic 학습용)
+        all_traffic = []
         all_rewards = {ax: [] for ax in REWARD_AXES}
         all_values = {ax: [] for ax in REWARD_AXES}
         prev_in_danger = torch.zeros(B, dtype=torch.bool, device=self.device)
+
+        # 연료 추적 (초기 1.0, 매 스텝 속도 비례 소모)
+        fuel = torch.ones(B, device=self.device)  # 0~1 비율
+        init_dist = prev_dist.clone()  # 초기 목적지 거리 저장
 
         empty_ctx = torch.zeros(B, MAX_NEIGHBORS, CONTEXT_DIM, device=self.device)
 
@@ -634,11 +729,22 @@ class DreamerTrainer:
                 ], dim=-1)  # (B, STATE_DIM)
                 reward_traffic[inject_mask, 0] = injected_state[inject_mask]
 
+            # 연료 소모 (속도 비례, 16스텝이면 1스텝당 ~6% 소모)
+            fuel_burn = next_own_raw[:, 3] / 600.0 * 0.06  # 속도/600 * 비율
+            fuel = (fuel - fuel_burn).clamp(min=0)
+
+            # 마지막 스텝 여부
+            is_last = (step == self.horizon - 1)
+            is_terminal_t = torch.full((B,), is_last, dtype=torch.bool, device=self.device)
+            # 연료 고갈도 터미널
+            is_terminal_t = is_terminal_t | (fuel <= 0)
+
             # 보상: 내 항공기 vs 트래픽
             rewards, cur_dist, in_danger = compute_reward_episode(
                 next_own_raw, reward_traffic, action, self.device,
                 dest_lat=dest_lat, dest_lon=dest_lon, dest_alt=dest_alt,
-                prev_dist=prev_dist, is_arrival=is_arrival,
+                prev_dist=prev_dist, init_dist=init_dist, is_arrival=is_arrival,
+                is_terminal=is_terminal_t, fuel_remaining=fuel,
                 injected=inject_mask, prev_in_danger=prev_in_danger)
             if cur_dist is not None:
                 prev_dist = cur_dist
@@ -748,24 +854,21 @@ class DreamerTrainer:
             losses = losses.clamp(min=0.1)
             # 높은 loss = 못하는 축 = 더 높은 가중치
             weights = losses / losses.sum()
-            # 가중치 하한/상한: safety 40~80%, efficiency/mission 각 최소 10%
-            w_dict = {ax: weights[i].item() for i, ax in enumerate(REWARD_AXES)}
-            w_dict['safety'] = max(0.4, min(0.8, w_dict['safety']))
-            w_dict['efficiency'] = max(0.1, w_dict['efficiency'])
-            w_dict['mission'] = max(0.1, w_dict['mission'])
+            # 고정 가중치: safety 50%, efficiency 25%, mission 25%
+            w_dict = {'safety': 0.50, 'efficiency': 0.25, 'mission': 0.25}
             # 정규화
             total = sum(w_dict.values())
             w_dict = {ax: v / total for ax, v in w_dict.items()}
 
-        # ── Actor 업데이트: 3축 가중합 advantage ──
+        # ── Actor 업데이트: PCGrad + certificate monitoring (PAVING) ──
         logits = self.actor(own_flat, traffic_flat)
         logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
         dist = torch.distributions.Categorical(logits=logits)
         actions_flat = rollout['actions'].reshape(B * H)
         log_probs = dist.log_prob(actions_flat)
 
-        # 축별 advantage 계산 후 가중합
-        total_advantage = torch.zeros(B * H, device=self.device)
+        # 축별 advantage 계산
+        advs = {}
         for ax in REWARD_AXES:
             with torch.no_grad():
                 v = self.critic.heads[ax](own_flat, traffic_flat)
@@ -773,17 +876,58 @@ class DreamerTrainer:
             adv = torch.nan_to_num(adv, nan=0.0)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             adv = adv.clamp(-5, 5)
-            total_advantage += adv * w_dict[ax]
+            advs[ax] = adv
 
-        actor_loss = -(log_probs * total_advantage).mean()
+        # PCGrad: 축별 gradient를 계산하고 충돌 시 projection
+        self.actor_opt.zero_grad()
+        task_grads = {}
         entropy = dist.entropy().mean()
-        actor_loss = actor_loss - 0.03 * entropy
 
-        if torch.isfinite(actor_loss):
-            self.actor_opt.zero_grad()
-            actor_loss.backward()
+        for ax in REWARD_AXES:
+            task_loss = -(log_probs * advs[ax] * w_dict[ax]).mean() - 0.01 * entropy
+            if torch.isfinite(task_loss):
+                task_loss.backward(retain_graph=True)
+                # 현재 gradient 저장
+                grad = []
+                for p in self.actor.parameters():
+                    if p.grad is not None:
+                        grad.append(p.grad.clone().flatten())
+                    else:
+                        grad.append(torch.zeros(p.numel(), device=self.device))
+                task_grads[ax] = torch.cat(grad)
+                self.actor_opt.zero_grad()
+
+        # Gradient projection: 충돌하는 gradient 성분 제거
+        if len(task_grads) == len(REWARD_AXES):
+            projected = {}
+            axes = list(REWARD_AXES)
+            for i, ax in enumerate(axes):
+                g = task_grads[ax].clone()
+                for j, other in enumerate(axes):
+                    if i == j:
+                        continue
+                    g_other = task_grads[other]
+                    dot = (g * g_other).sum()
+                    if dot < 0:  # 충돌하면 projection
+                        g = g - dot / (g_other.norm() ** 2 + 1e-8) * g_other
+                projected[ax] = g
+
+            # Projected gradient 합산 → Actor에 적용
+            final_grad = sum(projected.values())
+            idx = 0
+            for p in self.actor.parameters():
+                numel = p.numel()
+                if p.grad is None:
+                    p.grad = final_grad[idx:idx+numel].reshape(p.shape)
+                else:
+                    p.grad.copy_(final_grad[idx:idx+numel].reshape(p.shape))
+                idx += numel
+
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
+
+        # Certificate h = (1/K) Σ critic_loss_k² (PAVING)
+        cert_h = sum(v**2 for v in critic_losses.values()) / len(critic_losses)
 
         # Target critic soft update
         tau = 0.02
@@ -799,6 +943,9 @@ class DreamerTrainer:
 
         mean_v = {ax: rollout['values'][ax].mean().item() for ax in REWARD_AXES}
 
+        # 축별 보상 합계
+        r_sums = {ax: rollout['rewards'][ax].sum(dim=1).mean().item() for ax in REWARD_AXES}
+
         return {
             'actor_loss': actor_loss.item(),
             'critic_loss': sum(critic_losses.values()) / 3,
@@ -813,6 +960,10 @@ class DreamerTrainer:
             'w_safety': w_dict['safety'],
             'w_efficiency': w_dict['efficiency'],
             'w_mission': w_dict['mission'],
+            'r_safety': r_sums['safety'],
+            'r_efficiency': r_sums['efficiency'],
+            'r_mission': r_sums['mission'],
+            'certificate_h': cert_h,
             'crashes': crashes,
             'entropy': entropy.item(),
         }
