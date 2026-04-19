@@ -11,6 +11,7 @@ AI가 Safety Advisory 경고만 표시하는 데모.
   클릭: 항공기 선택
   [F] 선택 항공기 추적
   [R] Conflict 분석 새로고침
+  [W] ATS 항로/WP 표시 토글
   [A] Safety Alert ACK (선택 항공기 관련 경고)
   [1-3] 예측 범위 (1=2분, 2=5분, 3=10분)
   [SPACE] AI 예측 일시정지
@@ -20,6 +21,7 @@ import sys
 import os
 import time
 import math
+import json
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -47,7 +49,7 @@ from ai.world_model.dataset import STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS
 from utils import render_text_with_simple_outline
 
 # ── 설정 ──
-MODEL_PATH = "models/world_model/best_model.pt"
+MODEL_PATH = "models/world_model_v3/best_model.pt"
 DREAMER_PATH = "models/dreamer/best.pt"
 PREDICTION_INTERVAL = 3.0
 CONFLICT_SCAN_INTERVAL = 5.0
@@ -170,7 +172,7 @@ def generate_scenario(ac):
         else:
             moa_lat, moa_lon = 36.5, 127.5
         moa_name = moa.get("name", "MOA")
-        cruise_alt = random.choice([15000, 20000, 25000])
+        cruise_alt = random.choice([8000, 10000, 12000, 14000])
         dest = {"icao": "", "name": moa_name, "lat": moa_lat, "lon": moa_lon, "mil": True}
         waypoints = [
             (moa_lat, moa_lon, cruise_alt, moa_name),
@@ -275,6 +277,71 @@ class AircraftHistory:
             del self.states[k]
 
 
+class LabelPlacer:
+    """AABB 기반 라벨 위치선정 — 겹치면 오프셋 이동"""
+    OFFSETS = [(0, 0), (0, -18), (0, 18), (22, 0), (-22, 0),
+              (22, -18), (-22, -18), (22, 18), (-22, 18)]
+
+    def __init__(self):
+        self.rects = []
+
+    def find_pos(self, anchor_x, anchor_y, w, h):
+        """비충돌 위치 탐색. (x, y, shifted) 반환."""
+        for dx, dy in self.OFFSETS:
+            r = pygame.Rect(anchor_x + dx, anchor_y + dy, w, h)
+            if not any(r.colliderect(occ) for occ in self.rects):
+                self.rects.append(r)
+                return anchor_x + dx, anchor_y + dy, (dx != 0 or dy != 0)
+        # 전부 충돌 — 원래 위치 사용
+        self.rects.append(pygame.Rect(anchor_x, anchor_y, w, h))
+        return anchor_x, anchor_y, False
+
+    def reserve(self, x, y, w, h):
+        """영역 점유 등록 (직접 그리는 경우)"""
+        self.rects.append(pygame.Rect(x, y, w, h))
+
+
+def load_ats_routes(json_path):
+    """ats_routes_named.json 로드"""
+    if not os.path.exists(json_path):
+        print(f"[ATC] ATS routes not found: {json_path}")
+        return {}, []
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data.get("routes", {}), data.get("waypoints", [])
+
+
+# WP 타입별 심볼 색상
+_WP_COLORS = {
+    "VORTAC": (100, 200, 255),
+    "VOR": (100, 200, 255),
+    "TACAN": (100, 200, 255),
+    "FIX": (160, 160, 220),
+    "FIR_BDRY": (120, 120, 160),
+}
+_ROUTE_COLOR = (60, 130, 180)
+_ROUTE_LABEL_COLOR = (80, 150, 200)
+
+
+def draw_wp_symbol(screen, wp_type, sx, sy, size=5):
+    """WP 타입별 심볼 그리기"""
+    col = _WP_COLORS.get(wp_type, (160, 160, 220))
+    if wp_type in ("VORTAC", "VOR", "TACAN"):
+        # 다이아몬드
+        pts = [(sx, sy - size), (sx + size, sy),
+               (sx, sy + size), (sx - size, sy)]
+        pygame.draw.polygon(screen, col, pts, 2)
+    elif wp_type == "FIR_BDRY":
+        # 작은 사각형
+        pygame.draw.rect(screen, col,
+                         (sx - size//2, sy - size//2, size, size), 1)
+    else:
+        # FIX: 작은 삼각형
+        pts = [(sx, sy - size), (sx + size, sy + size//2),
+               (sx - size, sy + size//2)]
+        pygame.draw.polygon(screen, col, pts, 2)
+
+
 def predict_trajectories(model, history, icao, device, future_steps=12, num_mc=MC_SAMPLES_VIS):
     past = history.get_past(icao, PAST_STEPS)
     if past is None:
@@ -336,6 +403,12 @@ def main():
         time.sleep(0.3)
     print(f"[ATC] {len(sim.other_aircraft)} aircraft loaded")
 
+    # ATS 항로 로드
+    routes_json = os.path.join(os.path.dirname(__file__), "ats_routes_named.json")
+    ats_routes, ats_waypoints = load_ats_routes(routes_json)
+    if ats_routes:
+        print(f"[ATC] ATS routes loaded: {len(ats_routes)} routes, {len(ats_waypoints)} WPs")
+
     # 상태
     selected_icao = None
     follow_aircraft = False
@@ -343,6 +416,7 @@ def main():
     last_pred_time = 0
     future_steps = 12
     panel_clickables = []
+    show_routes = False
     paused = False
     scenarios = {}  # callsign -> Scenario
 
@@ -351,6 +425,7 @@ def main():
     print("  [N] Create aircraft  [I] Instruct selected")
     print("  [C] Deselect  [F] Follow  [A] ACK alert")
     print("  [T] Scenario  [D] Quick Descent/Climb  [R] Refresh")
+    print("  [W] ATS Routes toggle")
     print("  [1-3] Pred range  [SPACE] Pause AI  [ESC] Quit")
     print("=" * 55)
 
@@ -440,7 +515,7 @@ def main():
                     from core.aircraft import Aircraft
                     base = random.choice(MILITARY_AIRBASES)
                     callsign = f"SCN{random.randint(10,99)}"
-                    alt = random.choice([15000, 20000, 25000])
+                    alt = random.choice([8000, 10000, 12000, 14000])
                     spd = random.choice([400, 420, 450])
                     hdg = random.randint(0, 359)
                     ac = Aircraft(base["lat"], base["lon"], callsign, hdg, alt, spd)
@@ -467,6 +542,9 @@ def main():
                         new_alt = max(2000, ac.alt_current + shift)
                         ac.apply_instruction(ac.hdg_target, new_alt, ac.spd_target)
                         print(f"[ATC] Quick {'Descent' if shift < 0 else 'Climb'}: {ac.callsign} -> FL{new_alt/100:.0f}")
+                elif event.key == pygame.K_w:
+                    show_routes = not show_routes
+                    print(f"[ATC] ATS Routes: {'ON' if show_routes else 'OFF'}")
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
                 elif event.key == pygame.K_1:
@@ -669,11 +747,55 @@ def main():
 
         sim.map.draw(sim.screen)
 
+        # 줌 레벨 계산 (pixels per NM)
+        _ref_c = sim.map.latlon_to_screen(sim.map.center_lat, sim.map.center_lon)
+        _ref_1nm = sim.map.latlon_to_screen(sim.map.center_lat + 1/60, sim.map.center_lon)
+        px_per_nm = max(1, abs(_ref_1nm[1] - _ref_c[1]))
+
+        label_placer = LabelPlacer()
+
         # KADIZ
         kadiz_pts = [sim.map.latlon_to_screen(v[0], v[1]) for v in KADIZ_POLYGON]
         kadiz_int = [(int(p[0]), int(p[1])) for p in kadiz_pts]
         if len(kadiz_int) >= 3:
             pygame.draw.polygon(sim.screen, (200, 200, 0), kadiz_int, 2)
+
+        # ── ATS 항로 & WP ──
+        if show_routes and ats_routes:
+            # 항로 선 그리기
+            for route_name, wps in ats_routes.items():
+                pts = []
+                for wp in wps:
+                    sx, sy = sim.map.latlon_to_screen(wp["lat"], wp["lon"])
+                    pts.append((int(sx), int(sy)))
+                if len(pts) >= 2:
+                    pygame.draw.lines(sim.screen, _ROUTE_COLOR, False, pts, 1)
+                    # 항로 이름: 중간 지점에 표시
+                    mid_idx = len(pts) // 2
+                    mx, my = pts[mid_idx]
+                    if 0 <= mx < SCREEN_WIDTH and 0 <= my < SCREEN_HEIGHT:
+                        s = render_text_with_simple_outline(sim.font, route_name,
+                                                            _ROUTE_LABEL_COLOR, BLACK)
+                        sim.screen.blit(s, (mx - s.get_width() // 2, my - 12))
+            # WP 심볼 + 이름
+            for wp in ats_waypoints:
+                sx, sy = sim.map.latlon_to_screen(wp["lat"], wp["lon"])
+                sx_i, sy_i = int(sx), int(sy)
+                if sx_i < -50 or sx_i > SCREEN_WIDTH + 50 or sy_i < -50 or sy_i > SCREEN_HEIGHT + 50:
+                    continue
+                wp_type = wp.get("type", "FIX")
+                draw_wp_symbol(sim.screen, wp_type, sx_i, sy_i)
+                # 줌에 따라 WP 이름 표시 (너무 축소되면 생략)
+                if px_per_nm > 3:
+                    code = wp.get("code", "")
+                    disp = code if code else wp["name"]
+                    if px_per_nm < 8:
+                        # 중간 줌: NAVAID만 표시
+                        if wp_type not in ("VORTAC", "VOR", "TACAN"):
+                            continue
+                    col = _WP_COLORS.get(wp_type, (160, 160, 220))
+                    s = render_text_with_simple_outline(sim.font, disp, col, BLACK)
+                    sim.screen.blit(s, (sx_i + 7, sy_i - 4))
 
         # 공역
         moa_status = airspace_mgr.get_moa_status()
@@ -725,7 +847,10 @@ def main():
             if len(int_pts) >= 3:
                 pygame.draw.polygon(sim.screen, border_color, int_pts, 2)
             s = render_text_with_simple_outline(sim.font, label, border_color, BLACK)
-            sim.screen.blit(s, (int(avg_x) - s.get_width() // 2, int(avg_y) - 8))
+            lx, ly, _ = label_placer.find_pos(
+                int(avg_x) - s.get_width() // 2, int(avg_y) - 8,
+                s.get_width(), s.get_height())
+            sim.screen.blit(s, (lx, ly))
 
         # ── Conflict 라인 (alert 기반) ──
         for alert in conflict_alerts:
@@ -785,9 +910,9 @@ def main():
 
         # ── 항공기 렌더링 ──
         for ac in list(sim.other_aircraft.values()):
-            ac.draw(sim.screen, sim.map, sim.font)
+            ac.draw(sim.screen, sim.map, sim.font, label_placer=label_placer)
         for ac in sim.user_aircraft:
-            ac.draw(sim.screen, sim.map, sim.font)
+            ac.draw(sim.screen, sim.map, sim.font, label_placer=label_placer)
         sim._highlight_selected()
 
         # ── Risk 오버레이 (AI_RISK 경고 기반) ──
@@ -866,7 +991,7 @@ def main():
             f"Human ATC + AI Advisory [{mode}] | User: {n_user} External: {n_ext}",
             f"Pred: {pred_range} | Conflicts: {len(conflict_alerts)} | Risks: {len(risk_alerts)} | Alerts: {len(other_alerts)}",
             sel_info,
-            f"[N]Create [I]Instruct [C]Clear [F]{'Follow' if follow_aircraft else 'Free'} [A]ACK | {'PAUSED' if paused else 'Live'}",
+            f"[N]Create [I]Instruct [C]Clear [F]{'Follow' if follow_aircraft else 'Free'} [W]{'Routes' if show_routes else 'NoRte'} [A]ACK | {'PAUSED' if paused else 'Live'}",
         ]
 
         hud_h = len(hud_lines) * 20 + 10

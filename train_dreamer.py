@@ -123,7 +123,7 @@ def main():
         return
 
     # 학습 데이터 로드 + 메모리 프리로드
-    dataset = TrajectoryDataset(rec_dir, past_steps=6, future_steps=12, stride=4)
+    dataset = TrajectoryDataset(rec_dir, past_steps=6, future_steps=12, stride=2)
     print(f"[Dreamer] Dataset: {len(dataset)} samples")
     dataset.preload()
 
@@ -169,7 +169,7 @@ def main():
             data_iter = iter(loader)
             batch = next(data_iter)
 
-        past, future, ctx, msk, future_raw = batch
+        past, future, ctx, msk, future_raw = batch[:5]
         past_states = past.to(device)           # (B, K, D)
         past_contexts = ctx[:, :past.shape[1]].to(device)  # (B, K, MAX_N, CTX_D)
 
