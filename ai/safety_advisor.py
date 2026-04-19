@@ -332,14 +332,50 @@ class SafetyAdvisor:
                 spd_detail = f"{gs:.0f}kt (초과속도)"
             factors['speed'] = (spd_risk, spd_detail)
 
-            # 5. Overall (Critic 종합)
-            factors['ai_safety'] = (ai_safety, "AI Safety")
-            factors['ai_efficiency'] = (ai_efficiency, "AI Efficiency")
-            factors['ai_mission'] = (ai_mission, "AI Mission")
+            # ── Inner Task 위험도 (Dreamer 보상 함수 기준) ──
+            if k > 0:
+                nearest_idx = indices[0].item()
+                nearest_dist = dists_nm[ui, nearest_idx].item()
+                nearest_ac = ac_list[nearest_idx]
+                alt_diff = abs(uac.alt_current - nearest_ac.alt_current)
 
-            # 경고 임계값: 어느 요인이든 75% 이상이면 경고
+                # sep_h: 수평 분리 (5NM=100%, 10NM=50%, 15NM이상=0%)
+                if nearest_dist < 5.0:
+                    sep_h = 1.0
+                elif nearest_dist < 15.0:
+                    sep_h = (15.0 - nearest_dist) / 10.0
+                else:
+                    sep_h = 0.0
+                factors['inner:sep_h'] = (sep_h, f"{nearest_dist:.1f}NM")
+
+                # sep_v: 수직 분리 (500ft=100%, 1000ft=50%, 2000ft이상=0%)
+                if alt_diff < 500:
+                    sep_v = 1.0
+                elif alt_diff < 2000:
+                    sep_v = (2000 - alt_diff) / 1500.0
+                else:
+                    sep_v = 0.0
+                factors['inner:sep_v'] = (sep_v, f"{alt_diff:.0f}ft")
+
+            # alt_floor: 최저 안전 고도 (2000ft=100%, 5000ft=0%)
+            alt_val = uac.alt_current
+            if alt_val < 2000:
+                af = 1.0
+            elif alt_val < 5000:
+                af = (5000 - alt_val) / 3000.0
+            else:
+                af = 0.0
+            factors['inner:alt_floor'] = (af, f"{alt_val:.0f}ft")
+
+            # AI 축 점수 추가 (efficiency/mission은 80% 이상일 때만)
+            factors['ai_safety'] = (ai_safety, "")
+            if ai_efficiency >= 0.8:
+                factors['ai_efficiency'] = (ai_efficiency, "")
+            if ai_mission >= 0.8:
+                factors['ai_mission'] = (ai_mission, "")
+
             max_factor_risk = max(r for r, _ in factors.values())
-            if max_factor_risk < 0.50:
+            if max_factor_risk < 0.30:
                 continue
 
             # 심각도
@@ -350,7 +386,7 @@ class SafetyAdvisor:
             else:
                 severity = Severity.CAUTION
 
-            # 메시지: 위험 요인별 확률 나열
+            # 메시지: 세부 요인별 줄 구분
             factor_lines = []
             recs = []
             for fname, (frisk, fdetail) in factors.items():
@@ -359,11 +395,14 @@ class SafetyAdvisor:
                 label = {
                     'separation': 'SEP', 'convergence': 'CONV',
                     'altitude': 'ALT', 'speed': 'SPD',
+                    'inner:sep_h': 'IT:수평분리', 'inner:sep_v': 'IT:수직분리',
+                    'inner:alt_floor': 'IT:최저고도',
                     'ai_safety': 'AI:S', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
                 }.get(fname, fname)
-                factor_lines.append(f"{label}:{frisk:.0%}")
+                line = f"{label} {frisk:.0%}"
                 if fdetail:
-                    factor_lines[-1] += f"({fdetail})"
+                    line += f" — {fdetail}"
+                factor_lines.append(line)
                 # 요인별 권고
                 if fname == 'separation' and frisk >= 0.5:
                     recs.append("고도/방향 변경으로 분리 확보")

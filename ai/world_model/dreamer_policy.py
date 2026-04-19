@@ -281,10 +281,16 @@ def compute_reward_episode(own_state, traffic_states, action, device,
     return rewards, cur_dist, in_danger
 
 
-# ── Actor (Policy Network) ──
+# ── 연속 액션 공간 ──
+# 3차원: Δhdg, Δalt, Δspd (tanh → [-1,1] → 스케일링)
+CONT_ACTION_DIM = 3
+ACTION_SCALE = torch.tensor([30.0, 5000.0, 50.0])  # hdg ±30°, alt ±5000ft, spd ±50kt
+
+
+# ── Actor (Policy Network) — Gaussian 연속 정책 ──
 
 class Actor(nn.Module):
-    """관제 정책: 상태 → 행동 확률분포"""
+    """관제 정책: 상태 → 연속 행동 (Δhdg, Δalt, Δspd)"""
 
     def __init__(self, state_dim=STATE_DIM, hidden_dim=512):
         super().__init__()
@@ -300,18 +306,16 @@ class Actor(nn.Module):
             nn.Linear(WORLD_DIM, 64), nn.ELU(),
             nn.Linear(64, 64), nn.ELU(),
         )
-        self.policy_head = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(256 + 128 + 64, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
-            nn.Linear(hidden_dim, NUM_ACTIONS),
         )
+        self.mean_head = nn.Linear(hidden_dim, CONT_ACTION_DIM)
+        self.logstd_head = nn.Linear(hidden_dim, CONT_ACTION_DIM)
 
     def forward(self, own_state, traffic_states, world_feat=None):
         """
-        :param own_state: (B, STATE_DIM)
-        :param traffic_states: (B, 5, STATE_DIM) 가까운 5대
-        :param world_feat: (B, WORLD_DIM) 월드 피처 (optional)
-        :return: (B, NUM_ACTIONS) logits
+        :return: mean (B, 3), log_std (B, 3)
         """
         B = own_state.shape[0]
         s = self.state_enc(own_state)
@@ -320,14 +324,31 @@ class Actor(nn.Module):
             w = self.world_enc(world_feat)
         else:
             w = torch.zeros(B, 64, device=own_state.device)
-        return self.policy_head(torch.cat([s, t, w], dim=-1))
+        h = self.trunk(torch.cat([s, t, w], dim=-1))
+        mean = self.mean_head(h)
+        log_std = self.logstd_head(h).clamp(-5, 0)  # std ∈ [0.007, 1.0]
+        return mean, log_std
 
     def get_action(self, own_state, traffic_states, deterministic=False, world_feat=None):
-        logits = self.forward(own_state, traffic_states, world_feat=world_feat)
+        """tanh 스퀴싱된 액션 반환: (B, 3) ∈ [-1, 1]"""
+        mean, log_std = self.forward(own_state, traffic_states, world_feat=world_feat)
         if deterministic:
-            return logits.argmax(dim=-1)
-        dist = torch.distributions.Categorical(logits=logits)
-        return dist.sample()
+            return torch.tanh(mean)
+        std = log_std.exp()
+        noise = torch.randn_like(std)
+        return torch.tanh(mean + std * noise)
+
+    def log_prob(self, own_state, traffic_states, action, world_feat=None):
+        """Squashed Gaussian log probability"""
+        mean, log_std = self.forward(own_state, traffic_states, world_feat=world_feat)
+        std = log_std.exp()
+        # atanh (inverse tanh) for unsquashing
+        raw_action = torch.atanh(action.clamp(-0.999, 0.999))
+        # Gaussian log prob
+        log_p = -0.5 * ((raw_action - mean) / std).pow(2) - log_std - 0.5 * math.log(2 * math.pi)
+        # tanh Jacobian correction
+        log_p = log_p - torch.log(1 - action.pow(2) + 1e-6)
+        return log_p.sum(dim=-1)  # (B,)
 
 
 # ── Multi-Axis Critic (GAN-style 경쟁 학습) ──
@@ -422,24 +443,23 @@ class Critic(nn.Module):
 
     def risk_score(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: safety V → 위험도 [0,1].
-        safety는 raw space: 0=안전, -100=RA충돌. sigmoid(-V * 0.05)로 변환.
-          V=0 → 0.50, V=-20 → 0.73, V=-50 → 0.92, V=-100 → 0.99
+        sigmoid(-V * scale)로 변환. scale은 학습 완료 후 보정 필요.
 
-        TODO: 학습 후 held-out reliability diagram 기반 Platt/isotonic
-              보정으로 scale factor 0.05를 정당화해야 함.
+        NOTE: Actor 학습이 불충분하면 Critic의 V가 변별력 없음.
+              이 경우 룰 기반 요인(SEP/CONV/ALT/SPD)을 우선 사용할 것.
         """
         with torch.no_grad():
             v = self.safety(own_state, traffic_states, world_feat=world_feat)
-            return torch.sigmoid(-v * 0.05).clamp(0, 1)
+            return torch.sigmoid(-v * 0.01).clamp(0, 1)
 
     def axis_scores(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: 3축 점수 dict"""
         with torch.no_grad():
             vals = self.forward_all(own_state, traffic_states, world_feat=world_feat)
             return {
-                'safety': torch.sigmoid(-vals['safety'] * 0.05).clamp(0, 1),
-                'efficiency': torch.sigmoid(-vals['efficiency'] * 0.5).clamp(0, 1),
-                'mission': torch.sigmoid(-vals['mission'] * 0.5).clamp(0, 1),
+                'safety': torch.sigmoid(-vals['safety'] * 0.01).clamp(0, 1),
+                'efficiency': torch.sigmoid(-vals['efficiency'] * 0.1).clamp(0, 1),
+                'mission': torch.sigmoid(-vals['mission'] * 0.1).clamp(0, 1),
             }
 
 
@@ -455,7 +475,7 @@ def inject_events_batch(states_raw, device):
     """
     B = states_raw.shape[0]
     # 통합 확률: 0.03+0.02+0.005+0.04+0.01 ≈ 10.5%
-    inject_mask = torch.rand(B, device=device) < 0.105
+    inject_mask = torch.rand(B, device=device) < 0.0  # 이벤트 주입 비활성
 
     lat = states_raw[:, 0]
     lon = states_raw[:, 1]
@@ -500,7 +520,7 @@ class DreamerTrainer:
     """
 
     def __init__(self, world_model, device='cuda',
-                 imagination_horizon=15, gamma=0.99, actor_lr=1e-4, critic_lr=1e-4):
+                 imagination_horizon=15, gamma=0.99, actor_lr=1e-5, critic_lr=1e-4):
         self.world_model = world_model
         self.device = torch.device(device)
         self.world_model.to(self.device)
@@ -729,17 +749,14 @@ class DreamerTrainer:
             action = self.actor.get_action(own_norm, step_traffic_norm, world_feat=world_feat)
             all_actions.append(action)
 
-            # 내 항공기에 행동 반영 (target 방식)
-            # action_table: (hdg_target, alt_target, delta_spd, quick)
-            act_params = self._action_table[action]  # (B, 4)
-            is_hold = (action == NUM_ACTIONS - 1)
+            # 내 항공기에 행동 반영 (연속 액션: Δhdg, Δalt, Δspd)
+            # action: (B, 3) ∈ [-1, 1], 스케일링 적용
+            a_scale = ACTION_SCALE.to(self.device)  # [30, 5000, 50]
+            scaled = action * a_scale  # (B, 3)
             modified_raw = current_own_raw.clone()
-            # HDG: 목표 방위로 설정 (HOLD면 현재 유지)
-            modified_raw[:, 4] = torch.where(is_hold, modified_raw[:, 4], act_params[:, 0])
-            # ALT: 목표 고도로 설정
-            modified_raw[:, 2] = torch.where(is_hold, modified_raw[:, 2], act_params[:, 1].clamp(2000, 45000))
-            # SPD: delta 적용
-            modified_raw[:, 3] = (modified_raw[:, 3] + act_params[:, 2]).clamp(200, 600)
+            modified_raw[:, 4] = (modified_raw[:, 4] + scaled[:, 0]) % 360  # Δhdg
+            modified_raw[:, 2] = (modified_raw[:, 2] + scaled[:, 1]).clamp(2000, 45000)  # Δalt
+            modified_raw[:, 3] = (modified_raw[:, 3] + scaled[:, 2]).clamp(200, 600)  # Δspd
 
             # WM으로 내 항공기 다음 상태 예측 (delta 방식)
             modified_norm = self._normalize(modified_raw)
@@ -903,16 +920,14 @@ class DreamerTrainer:
         # PAVING: 가중치 없이 φ = ΣL_k 합산. Inner task 직교성이 보장하면 conflict 없음.
         w_dict = {'safety': 1.0/3, 'efficiency': 1.0/3, 'mission': 1.0/3}  # 균등 (로깅용)
 
-        # ── Actor 업데이트: PAVING (φ = ΣL_k 단순 합산) ──
-        # Inner task가 직교하면 gradient conflict 없음 (CANON, Remark 1)
-        logits = self.actor(own_flat, traffic_flat, world_feat=world_flat)
-        logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
-        dist = torch.distributions.Categorical(logits=logits)
-        actions_flat = rollout['actions'].reshape(B * H)
-        log_probs = dist.log_prob(actions_flat)
-        entropy = dist.entropy().mean()
+        # ── Actor 업데이트: 연속 정책 + φ-flow ──
+        actions_flat = rollout['actions'].reshape(B * H, CONT_ACTION_DIM)
+        log_probs = self.actor.log_prob(own_flat, traffic_flat, actions_flat,
+                                         world_feat=world_flat)
 
-        # 축별 advantage → 단순 합산 (φ-flow)
+        # 축별 advantage → 축 내 정규화 후 가중 합산
+        # safety 40%, efficiency 30%, mission 30%
+        axis_weights = {'safety': 0.4, 'efficiency': 0.3, 'mission': 0.3}
         total_advantage = torch.zeros(B * H, device=self.device)
         advs = {}
         for ax in REWARD_AXES:
@@ -921,11 +936,14 @@ class DreamerTrainer:
             adv = (targets_per_axis[ax] - v).detach()
             adv = torch.nan_to_num(adv, nan=0.0)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            adv = adv.clamp(-5, 5)
             advs[ax] = adv
-            total_advantage += adv  # PAVING: 가중치 없이 합산
+            total_advantage += adv * axis_weights[ax]
 
-        actor_loss = -(log_probs * total_advantage).mean() - 0.03 * entropy
+        # 연속 정책: entropy bonus 대신 log_std regularization
+        _, log_std = self.actor(own_flat, traffic_flat, world_feat=world_flat)
+        entropy = -log_std.mean()  # log_std가 클수록 탐색 많음
+
+        actor_loss = -(log_probs * total_advantage).mean() - 0.01 * entropy
 
         if torch.isfinite(actor_loss):
             self.actor_opt.zero_grad()
@@ -1011,16 +1029,23 @@ class DreamerTrainer:
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if 'actor' in ckpt:
-            self.actor.load_state_dict(ckpt['actor'])
-            self.critic.load_state_dict(ckpt['critic'])
-            self.target_critic.load_state_dict(ckpt['target_critic'])
-            self.actor_opt.load_state_dict(ckpt['actor_opt'])
-            if 'critic_opts' in ckpt:
-                for ax, state in ckpt['critic_opts'].items():
-                    self.critic_opts[ax].load_state_dict(state)
-            elif 'critic_opt' in ckpt:
-                pass  # 이전 형식 호환 — 무시하고 새 optimizer 사용
-            print(f"[Dreamer] Loaded actor/critic from checkpoint")
+            # Actor 로드 (구조 변경 시 스킵)
+            try:
+                self.actor.load_state_dict(ckpt['actor'])
+                self.actor_opt.load_state_dict(ckpt['actor_opt'])
+                print(f"[Dreamer] Loaded actor from checkpoint")
+            except RuntimeError as e:
+                print(f"[Dreamer] Actor structure changed, starting fresh: {e}")
+            # Critic 로드 (구조 유지)
+            try:
+                self.critic.load_state_dict(ckpt['critic'])
+                self.target_critic.load_state_dict(ckpt['target_critic'])
+                if 'critic_opts' in ckpt:
+                    for ax, state in ckpt['critic_opts'].items():
+                        self.critic_opts[ax].load_state_dict(state)
+                print(f"[Dreamer] Loaded critic from checkpoint")
+            except RuntimeError as e:
+                print(f"[Dreamer] Critic load failed: {e}")
         else:
             print(f"[Dreamer] No actor/critic in checkpoint - starting fresh")
         self.total_episodes = ckpt.get('total_episodes', 0)

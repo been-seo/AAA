@@ -1037,7 +1037,14 @@ def main():
 
         # ── AI Risk 패널 (우측 중간) ──
         if risk_alerts:
-            panel_h = min(len(risk_alerts[:5]) * 45 + 30, 300)
+            # 1차: 콘텐츠 높이 계산
+            content_lines = 1  # 제목
+            for alert in risk_alerts[:5]:
+                content_lines += 1  # [SEVERITY] title
+                msg_parts = alert.message.split(" | ")
+                content_lines += min(len(msg_parts), 6)  # 세부 요인
+                content_lines += 0.3  # 간격
+            panel_h = int(content_lines * 16 + 20)
             bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
             bg.fill((0, 0, 0, 200))
             sim.screen.blit(bg, (panel_x, panel_top))
@@ -1050,11 +1057,14 @@ def main():
                 s = font.render(f"[{alert.severity.name}] {alert.title}", True, col)
                 sim.screen.blit(s, (panel_x + 10, ay))
                 ay += 16
-                # 세부 요인 표시 (message에 SEP/CONV/ALT/SPD/AI 포함)
-                msg = alert.message[:72] + "..." if len(alert.message) > 72 else alert.message
-                s = font.render(msg, True, (180, 180, 180))
-                sim.screen.blit(s, (panel_x + 15, ay))
-                ay += 26
+                # 세부 요인 표시 — | 구분자로 여러 줄 분할
+                msg_parts = alert.message.split(" | ")
+                for part in msg_parts[:6]:
+                    part = part.strip()
+                    s = font.render(part, True, (180, 180, 180))
+                    sim.screen.blit(s, (panel_x + 15, ay))
+                    ay += 15
+                ay += 5
                 click_rect = pygame.Rect(panel_x, item_y, panel_w, ay - item_y)
                 target = alert.aircraft_involved[0] if alert.aircraft_involved else None
                 if target:
