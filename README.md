@@ -182,7 +182,7 @@ AAA/
 - Janner et al., "When to Trust Your Model: Model-Based Policy Optimization", NeurIPS 2019
 - Hafner et al., "Dream to Control: Learning Behaviors by Latent Imagination", ICLR 2020
 - Hafner et al., "Mastering Diverse Domains through World Models", arXiv 2023 (DreamerV3)
-- Seo, "Paving the Loss Landscape: Environment Design for Failure Predictability in Multi-Task Learning", 2026
+- Seo, "Paving the Loss Landscape: Environment Design for Failure Predictability in Multi-Task Learning", 2026, doi: 10.5281/zenodo.19454888
 
 ## License
 

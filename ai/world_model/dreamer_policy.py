@@ -741,7 +741,7 @@ class DreamerTrainer:
             # SPD: delta 적용
             modified_raw[:, 3] = (modified_raw[:, 3] + act_params[:, 2]).clamp(200, 600)
 
-            # WM으로 내 항공기 다음 상태 예측
+            # WM으로 내 항공기 다음 상태 예측 (delta 방식)
             modified_norm = self._normalize(modified_raw)
             with torch.no_grad():
                 state_emb = self.world_model._encode_state(modified_norm)
@@ -754,8 +754,8 @@ class DreamerTrainer:
                 h_t = gru_out.squeeze(1)
                 prior_mean, prior_logstd = self.world_model._prior(h_t)
                 z = self.world_model._sample_z(prior_mean, prior_logstd)
-                pred_mean, pred_logstd = self.world_model._decode_state(h_t, z)
-                next_own_norm = self.world_model._sample_z(pred_mean, pred_logstd)
+                pred_delta = self.world_model._decode_delta(h_t, z)
+                next_own_norm = modified_norm + pred_delta
 
             next_own_raw = self._denormalize(next_own_norm)
 
