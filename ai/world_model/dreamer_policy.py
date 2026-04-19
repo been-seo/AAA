@@ -13,6 +13,7 @@ Dreamer-style MBPO: World Model 안에서 관제를 "꿈꾸며" 학습
 tight vectoring은 안전하다는 것도 경험으로 학습.
 """
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +23,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .dataset import (STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM,
-                       WORLD_DIM, _load_waypoints, _get_nearest_waypoints)
+                       WORLD_DIM, _load_waypoints, _get_nearest_waypoints,
+                       _get_nearest_waypoints_batch)
 
 # 군용 기지 좌표 (목적지 할당용) — config.py에서 가져올 수 없으므로 직접 정의
 _DEST_COORDS = [
@@ -526,17 +528,11 @@ class DreamerTrainer:
         self.total_safe = 0
 
         # World context (waypoints)
-        try:
-            import os
-            data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
-            wp_data = _load_waypoints(data_dir)
-            if wp_data is not None:
-                self._wp_array, self._wp_types, self._wp_names = wp_data
-                self._has_world = True
-            else:
-                self._has_world = False
-        except Exception:
-            self._has_world = False
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+        wp_data = _load_waypoints(data_dir)
+        self._has_world = wp_data is not None
+        if self._has_world:
+            self._wp_array, self._wp_types, self._wp_names = wp_data
 
     def _denormalize(self, state_norm):
         return state_norm * self.norm_std + self.norm_mean
@@ -545,18 +541,16 @@ class DreamerTrainer:
         return (state_raw - self.norm_mean) / self.norm_std
 
     def _compute_world_feat(self, states_raw):
-        """배치의 raw 상태에서 world features 계산. (B, D) → (B, WORLD_DIM)"""
+        """배치의 raw 상태에서 world features 계산. (B, D) → (B, WORLD_DIM).
+        GPU→CPU 한 번만 sync, numpy 배치 연산으로 처리.
+        """
         if not self._has_world:
             return None
-        B = states_raw.shape[0]
-        feats = []
-        for i in range(B):
-            lat = states_raw[i, 0].item()
-            lon = states_raw[i, 1].item()
-            track = states_raw[i, 4].item()
-            feat = _get_nearest_waypoints(lat, lon, track, self._wp_array, self._wp_types, k=3)
-            feats.append(feat)
-        return torch.tensor(feats, dtype=torch.float32, device=self.device)
+        coords = states_raw[:, [0, 1, 4]].detach().cpu().numpy()  # (B, 3) — 한 번만 sync
+        feat = _get_nearest_waypoints_batch(
+            coords[:, 0], coords[:, 1], coords[:, 2],
+            self._wp_array, self._wp_types, k=3)
+        return torch.from_numpy(feat).to(self.device)
 
     def _get_nearby_traffic(self, all_states_raw, own_idx, k=5):
         """주변 항공기 5대 추출 (거리순)"""
@@ -604,19 +598,18 @@ class DreamerTrainer:
                         device=self.device)
         z = torch.zeros(B, self.world_model.latent_dim, device=self.device)
 
-        # 초기 world context 계산 (warm-up용)
-        init_raw = self._denormalize(initial_states_norm[:, 0])
-        warmup_world_feat = self._compute_world_feat(init_raw)
-
         with torch.no_grad():
             for t in range(K):
                 state_t = initial_states_norm[:, t]
                 ctx_t = initial_contexts[:, t]
                 state_emb = self.world_model._encode_state(state_t)
                 interaction = self.world_model.neighbor_attn(state_emb, ctx_t)
+                # per-step world context
+                step_raw = self._denormalize(state_t)
+                step_world = self._compute_world_feat(step_raw)
                 world_emb = None
-                if warmup_world_feat is not None:
-                    world_emb = self.world_model._encode_world(warmup_world_feat)
+                if step_world is not None:
+                    world_emb = self.world_model._encode_world(step_world)
                 gru_in = self.world_model._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
                 gru_out, h = self.world_model.gru(gru_in, h)
                 h_t = gru_out.squeeze(1)

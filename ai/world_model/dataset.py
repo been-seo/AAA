@@ -123,6 +123,37 @@ def _get_nearest_waypoints(lat, lon, track_deg, wp_array, wp_types, k=MAX_NEARES
     return feat
 
 
+def _get_nearest_waypoints_batch(lats, lons, tracks, wp_array, wp_types, k=MAX_NEAREST_WP):
+    """배치 벡터화: (B,) arrays → (B, k*WP_FEAT_DIM) = (B, 12).
+    GPU→CPU 한 번만 sync. numpy 배치 연산.
+    """
+    B = len(lats)
+    W = wp_array.shape[0]
+    cos_lat = np.cos(np.radians(lats))[:, None]  # (B, 1)
+    dx_all = (wp_array[None, :, 1] - lons[:, None]) * 60.0 * cos_lat  # (B, W)
+    dy_all = (wp_array[None, :, 0] - lats[:, None]) * 60.0  # (B, W)
+    dist_sq = dx_all**2 + dy_all**2  # (B, W)
+    topk_idx = np.argpartition(dist_sq, min(k, W - 1), axis=1)[:, :k]  # (B, k)
+    # sort within top-k
+    row_idx = np.arange(B)[:, None]
+    topk_dist = dist_sq[row_idx, topk_idx]
+    sort_order = np.argsort(topk_dist, axis=1)
+    topk_idx = topk_idx[row_idx, sort_order]
+
+    feat = np.zeros((B, k * WP_FEAT_DIM), dtype=np.float32)
+    for i in range(k):
+        idx = topk_idx[:, i]  # (B,)
+        dx_nm = dx_all[row_idx[:, 0], idx]  # (B,)
+        dy_nm = dy_all[row_idx[:, 0], idx]  # (B,)
+        wp_bearing = np.degrees(np.arctan2(dx_nm, dy_nm)) % 360
+        bearing_offset = ((wp_bearing - tracks + 180) % 360 - 180) / 180.0
+        feat[:, i * WP_FEAT_DIM + 0] = dx_nm / 100.0
+        feat[:, i * WP_FEAT_DIM + 1] = dy_nm / 100.0
+        feat[:, i * WP_FEAT_DIM + 2] = wp_types[idx]
+        feat[:, i * WP_FEAT_DIM + 3] = bearing_offset
+    return feat
+
+
 def _interpolate_nans(states):
     """NaN 보간: 선형 보간 → 남은 NaN은 평균으로."""
     mask = ~np.isnan(states)
