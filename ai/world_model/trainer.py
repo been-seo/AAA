@@ -7,8 +7,6 @@ ADS-B 녹화 데이터로 TrajectoryPredictor 학습:
 3. 검증: conflict prediction 정확도
 4. 체크포인트 저장
 
-v2: World context (웨이포인트 피처) 지원
-
 사용법:
     python -m ai.world_model.trainer --data-dir data/recordings --epochs 100
 """
@@ -27,6 +25,8 @@ from .dataset import TrajectoryDataset, STATE_DIM
 from .trajectory_predictor import TrajectoryPredictor
 from .conflict_detector import ConflictDetector
 
+
+# ── 학습 결과 DB ──
 
 _TRAIN_DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -92,16 +92,6 @@ class TrainLogger:
         self._conn.close()
 
 
-def _unpack_batch(batch, device):
-    """배치 언팩 — world context 유무에 따라 처리."""
-    if len(batch) == 6:
-        past, future, ctx, mask, future_raw, world = [x.to(device) for x in batch]
-    else:
-        past, future, ctx, mask, future_raw = [x.to(device) for x in batch]
-        world = None
-    return past, future, ctx, mask, future_raw, world
-
-
 def train_epoch(model, loader, optimizer, device, kl_weight=0.1, grad_clip=100.0):
     model.train()
     total_loss = 0
@@ -110,10 +100,10 @@ def train_epoch(model, loader, optimizer, device, kl_weight=0.1, grad_clip=100.0
     n_batches = 0
 
     for batch in loader:
-        past, future, ctx, mask, future_raw, world = _unpack_batch(batch, device)
+        past, future, ctx, mask, future_raw = [x.to(device) for x in batch]
 
         losses = model.compute_loss(past, future, ctx, future_raw,
-                                    world=world, kl_weight=kl_weight)
+                                    kl_weight=kl_weight)
 
         optimizer.zero_grad()
         losses['total_loss'].backward()
@@ -140,26 +130,29 @@ def validate(model, loader, device, kl_weight=0.1):
     total_kl = 0
     n_batches = 0
 
+    # 위치 예측 오차 (NM)
     position_errors = []
 
     for batch in loader:
-        past, future, ctx, mask, future_raw, world = _unpack_batch(batch, device)
+        past, future, ctx, mask, future_raw = [x.to(device) for x in batch]
 
         losses = model.compute_loss(past, future, ctx, future_raw,
-                                    world=world, kl_weight=kl_weight)
+                                    kl_weight=kl_weight)
 
         total_loss += losses['total_loss'].item()
         total_recon += losses['recon_loss'].item()
         total_kl += losses['kl_loss'].item()
 
         # 위치 오차 계산 (비정규화 공간)
-        output = model(past, future, ctx, world=world)
-        pred_mean = output['future_pred_mean']
+        output = model(past, future, ctx)
+        pred_mean = output['future_pred_mean']  # (B, N, D) 정규화됨
+        # 비정규화
         pred_raw = pred_mean * model.norm_std + model.norm_mean
-        lat_err = (pred_raw[:, :, 0] - future_raw[:, :, 0]) * 60.0
+        # 위치 오차 (lat, lon → NM 근사)
+        lat_err = (pred_raw[:, :, 0] - future_raw[:, :, 0]) * 60.0  # NM
         lon_err = (pred_raw[:, :, 1] - future_raw[:, :, 1]) * 60.0 * \
                   torch.cos(torch.deg2rad(future_raw[:, :, 0])).clamp(min=0.5)
-        pos_err = torch.sqrt(lat_err**2 + lon_err**2)
+        pos_err = torch.sqrt(lat_err**2 + lon_err**2)  # NM
         position_errors.append(pos_err.cpu().numpy())
 
         n_batches += 1
@@ -179,7 +172,7 @@ def validate(model, loader, device, kl_weight=0.1):
 def main():
     parser = argparse.ArgumentParser(description="World Model Trainer")
     parser.add_argument('--data-dir', type=str, default='data/recordings',
-                        help='ADS-B 녹화 디렉토리')
+                        help='ADS-B JSONL 디렉토리')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -226,13 +219,9 @@ def main():
     model = TrajectoryPredictor(
         hidden_dim=args.hidden_dim,
         latent_dim=args.latent_dim,
-        world_dim=dataset.world_dim,
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"[Trainer] Model params: {param_count:,}")
-    print(f"[Trainer] World context: {'enabled' if dataset.has_world else 'disabled'} "
-          f"(dim={dataset.world_dim})")
 
     # DB 로거
     db_log = TrainLogger(args.log_db)
@@ -248,6 +237,7 @@ def main():
             return args.kl_weight * (epoch / 10)
         return args.kl_weight
 
+    # 체크포인트 디렉토리
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -268,6 +258,7 @@ def main():
         is_best = val_metrics['loss'] < best_val_loss
         db_log.log_epoch(epoch, train_metrics, val_metrics, lr, dt, is_best)
 
+        # Best model 저장
         if is_best:
             best_val_loss = val_metrics['loss']
             patience_counter = 0
@@ -278,27 +269,26 @@ def main():
                 'val_loss': best_val_loss,
                 'val_metrics': val_metrics,
                 'args': vars(args),
-                'world_dim': dataset.world_dim,
             }, save_dir / 'best_model.pt')
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
                 break
 
+        # 주기적 체크포인트
         if epoch % 20 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_metrics': val_metrics,
-                'world_dim': dataset.world_dim,
             }, save_dir / f'checkpoint_ep{epoch}.pt')
 
+    # 최종 저장
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'val_metrics': val_metrics,
-        'world_dim': dataset.world_dim,
     }, save_dir / 'final_model.pt')
 
     db_log.close()
