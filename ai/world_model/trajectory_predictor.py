@@ -1,20 +1,43 @@
 """
-RSSM 기반 항공기 궤적 예측 모델
+Delta 기반 항공기 궤적 예측 모델
 
-Dreamer-v3 영감:
-- Deterministic path (GRU) + Stochastic latent (Gaussian)
-- 주변 항공기 interaction을 cross-attention으로 처리
-- 출력: 미래 상태의 mean + std (확률적 예측)
+핵심: 다음 상태의 절대 좌표가 아닌 Δ(변화량)를 직접 예측.
+  - Δlat, Δlon, Δalt, Δgs, Δtrack, Δvrate, ...
+  - 다음 상태 = 현재 상태 + Δ
+  - 물리 clamp: 비현실적 Δ는 사후에 잘라냄
+  - envelope/ratio/residual 없음 → 단순하고 빠름
 
-입력: 과거 K스텝 상태 + 주변 항공기 context
-출력: 미래 N스텝 상태 분포 (mean, log_std)
+구조:
+  1. State Encoder: state(10D) → sin/cos 치환 12D → 128D
+  2. Neighbor Attention: cross-attention으로 주변 항공기 interaction
+  3. RSSM Core: GRU(deterministic) + VAE(stochastic)
+  4. Delta Decoder: (hidden, z) → Δstate (unbounded)
 """
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from .dataset import STATE_DIM, CONTEXT_DIM, MAX_NEIGHBORS, NORM_MEAN, NORM_STD, WORLD_DIM
+
+# 물리 clamp 한계 (10초 간격 기준, 비정규화 공간)
+# [Δlat_max, Δlon_max, Δalt_max, Δgs_max, Δtrack_max, Δvrate_max, ...]
+_DELTA_CLAMP_RAW = np.array([
+    0.05,    # lat: ~3NM
+    0.05,    # lon: ~3NM
+    3333,    # alt: 20000fpm * 10s
+    200,     # gs: ±200kt
+    180,     # track: ±180° (전방위)
+    10000,   # vrate: ±10000fpm
+    200,     # ias
+    0.3,     # mach
+    360,     # wind_dir
+    60,      # wind_spd
+], dtype=np.float32)
+
+# 정규화 공간에서의 clamp
+_DELTA_CLAMP_NORM = _DELTA_CLAMP_RAW / NORM_STD
 
 
 class NeighborAttention(nn.Module):
@@ -32,25 +55,14 @@ class NeighborAttention(nn.Module):
         self.layer_norm = nn.LayerNorm(out_dim)
 
     def forward(self, query, context):
-        """
-        :param query: (batch, query_dim) — 현재 항공기 latent
-        :param context: (batch, max_neighbors, context_dim) — 주변 항공기
-        :return: (batch, out_dim)
-        """
         B, N, _ = context.shape
-
         Q = self.q_proj(query).view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
         K = self.k_proj(context).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(context).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Scaled dot-product attention
         scores = (Q @ K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # 빈 이웃 마스킹 (context가 0벡터이면 무시)
-        ctx_norm = context.norm(dim=-1)  # (B, N)
-        mask = (ctx_norm < 1e-6).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
+        ctx_norm = context.norm(dim=-1)
+        mask = (ctx_norm < 1e-6).unsqueeze(1).unsqueeze(2)
         scores = scores.masked_fill(mask, -1e9)
-
         attn = F.softmax(scores, dim=-1)
         out = (attn @ V).transpose(1, 2).contiguous().view(B, -1)
         out = self.out_proj(out)
@@ -59,33 +71,26 @@ class NeighborAttention(nn.Module):
 
 class TrajectoryPredictor(nn.Module):
     """
-    RSSM 스타일 궤적 예측 모델
+    Delta 기반 RSSM 궤적 예측 모델
 
-    Architecture:
-    1. State Encoder: state(10d) → embedding(128d)
-    2. Context Encoder: neighbor attention → interaction(64d)
-    3. RSSM Core:
-       - Deterministic: GRU(embedding + interaction → hidden)
-       - Stochastic: hidden → (z_mean, z_std)
-       - Prior: hidden → (z_mean_prior, z_std_prior)
-    4. Decoder: (hidden, z) → state_mean, state_log_std
+    디코더: Δstate를 직접 출력 (정규화 공간).
+    다음 상태 = 현재 상태 + Δ, 물리 clamp 적용.
     """
 
     def __init__(self, hidden_dim=256, latent_dim=64, interaction_dim=64,
-                 num_gru_layers=2, dropout=0.1):
+                 num_gru_layers=2, dropout=0.1, use_world=True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.use_world = use_world
 
-        # State encoder (입력 10D → deg→sincos 치환 12D → 128D)
-        # track_deg(idx4), wind_dir(idx8)을 sin/cos로 치환 (원본 deg 제거)
-        # 10 - 2(deg) + 4(sin/cos) = 12D
-        self._track_mean = NORM_MEAN[4]  # 180
-        self._track_std = NORM_STD[4]    # 180
-        self._wind_mean = NORM_MEAN[8]   # 180
-        self._wind_std = NORM_STD[8]     # 180
+        # State encoder (10D → sin/cos 치환 12D → 128D)
+        self._track_mean = NORM_MEAN[4]
+        self._track_std = NORM_STD[4]
+        self._wind_mean = NORM_MEAN[8]
+        self._wind_std = NORM_STD[8]
         self.state_encoder = nn.Sequential(
-            nn.Linear(STATE_DIM - 2 + 4, 128),  # 12D input
+            nn.Linear(STATE_DIM - 2 + 4, 128),
             nn.ELU(),
             nn.Linear(128, 128),
             nn.ELU(),
@@ -96,200 +101,175 @@ class TrajectoryPredictor(nn.Module):
             query_dim=128, context_dim=CONTEXT_DIM,
             num_heads=2, out_dim=interaction_dim)
 
-        # World context encoder (waypoint features → embedding)
-        self.world_encoder = nn.Sequential(
-            nn.Linear(WORLD_DIM, 64),
-            nn.ELU(),
-            nn.Linear(64, 64),
-            nn.ELU(),
-        )
-        self.world_embed_dim = 64
+        # World context encoder
+        if use_world:
+            self.world_encoder = nn.Sequential(
+                nn.Linear(WORLD_DIM, 64), nn.ELU(),
+                nn.Linear(64, 64), nn.ELU(),
+            )
+        self.world_embed_dim = 64 if use_world else 0
 
-        # GRU (deterministic path)
-        gru_input_dim = 128 + interaction_dim + latent_dim + 64  # +64 world embed
+        # GRU
+        gru_input_dim = 128 + interaction_dim + latent_dim + self.world_embed_dim
         self.gru = nn.GRU(gru_input_dim, hidden_dim,
                           num_layers=num_gru_layers,
                           batch_first=True, dropout=dropout if num_gru_layers > 1 else 0)
 
-        # Posterior: (hidden, state_emb) → z
+        # Posterior & Prior
         self.posterior_net = nn.Sequential(
-            nn.Linear(hidden_dim + 128, 256),
-            nn.ELU(),
-            nn.Linear(256, latent_dim * 2),  # mean + log_std
+            nn.Linear(hidden_dim + 128, 256), nn.ELU(),
+            nn.Linear(256, latent_dim * 2),
         )
-
-        # Prior: hidden → z (for prediction / KL)
         self.prior_net = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ELU(),
+            nn.Linear(hidden_dim, 256), nn.ELU(),
             nn.Linear(256, latent_dim * 2),
         )
 
-        # State decoder: (hidden, z) → state prediction
-        self.state_decoder = nn.Sequential(
+        # Delta decoder: (hidden, z) → Δstate (정규화 공간)
+        self.delta_decoder = nn.Sequential(
             nn.Linear(hidden_dim + latent_dim, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
+            nn.Linear(128, STATE_DIM),
         )
-        self.state_mean_head = nn.Linear(128, STATE_DIM)
-        self.state_logstd_head = nn.Linear(128, STATE_DIM)
 
-        # Normalization params (registered as buffers for device handling)
+        # Normalization params
         self.register_buffer('norm_mean', torch.from_numpy(NORM_MEAN))
         self.register_buffer('norm_std', torch.from_numpy(NORM_STD))
+        self.register_buffer('delta_clamp', torch.from_numpy(_DELTA_CLAMP_NORM))
+
+    # ── Encoder helpers ──
 
     def _deg_to_sincos(self, state):
-        """모델 내부: 정규화된 deg → 원본 deg 복원 → sin/cos 치환. (B, 10) → (B, 12)
-        idx 4 (track_deg), idx 8 (wind_dir)를 sin/cos로 치환 (원본 deg 제거)."""
-        # 정규화된 값을 원본 deg로 복원
         track_deg = state[:, 4:5] * self._track_std + self._track_mean
         wind_deg = state[:, 8:9] * self._wind_std + self._wind_mean
         track_rad = track_deg * (3.14159265 / 180.0)
         wind_rad = wind_deg * (3.14159265 / 180.0)
         return torch.cat([
-            state[:, :4],                                    # lat, lon, alt, gs
-            torch.sin(track_rad), torch.cos(track_rad),      # track sin/cos (원본 deg 제거)
-            state[:, 5:8],                                    # vrate, ias, mach
-            torch.sin(wind_rad), torch.cos(wind_rad),         # wind sin/cos (원본 deg 제거)
-            state[:, 9:],                                     # wind_spd
-        ], dim=-1)  # (B, 12)
+            state[:, :4],
+            torch.sin(track_rad), torch.cos(track_rad),
+            state[:, 5:8],
+            torch.sin(wind_rad), torch.cos(wind_rad),
+            state[:, 9:],
+        ], dim=-1)
 
     def _encode_state(self, state):
-        """state (B, STATE_DIM=10) → embedding (B, 128). 내부에서 deg→sin/cos 치환."""
-        expanded = self._deg_to_sincos(state)  # (B, 12)
-        return self.state_encoder(expanded)
+        return self.state_encoder(self._deg_to_sincos(state))
 
     def _encode_world(self, world_feat):
-        """world features (B, WORLD_DIM) → embedding (B, 64)"""
-        if world_feat is None:
+        if not self.use_world or world_feat is None:
             return None
         return self.world_encoder(world_feat)
 
     def _build_gru_input(self, state_emb, interaction, z, world_emb=None):
-        """GRU input 조합: state_emb + interaction + z + world_emb"""
-        if world_emb is None:
-            world_emb = torch.zeros(state_emb.shape[0], self.world_embed_dim,
-                                    device=state_emb.device)
-        return torch.cat([state_emb, interaction, z, world_emb], dim=-1)
+        parts = [state_emb, interaction, z]
+        if self.use_world:
+            if world_emb is None:
+                world_emb = torch.zeros(state_emb.shape[0], self.world_embed_dim,
+                                        device=state_emb.device)
+            parts.append(world_emb)
+        return torch.cat(parts, dim=-1)
 
     def _posterior(self, hidden, state_emb):
-        """Posterior q(z|h, x): 관측이 있을 때의 latent"""
-        inp = torch.cat([hidden, state_emb], dim=-1)
-        params = self.posterior_net(inp)
+        params = self.posterior_net(torch.cat([hidden, state_emb], dim=-1))
         mean, log_std = params.chunk(2, dim=-1)
-        log_std = log_std.clamp(-5, 2)
-        return mean, log_std
+        return mean, log_std.clamp(-5, 2)
 
     def _prior(self, hidden):
-        """Prior p(z|h): 관측 없이 hidden만으로 예측"""
         params = self.prior_net(hidden)
         mean, log_std = params.chunk(2, dim=-1)
-        log_std = log_std.clamp(-5, 2)
-        return mean, log_std
+        return mean, log_std.clamp(-5, 2)
 
     def _sample_z(self, mean, log_std):
-        """Reparameterization trick"""
-        std = log_std.exp()
-        eps = torch.randn_like(std)
-        return mean + std * eps
+        return mean + log_std.exp() * torch.randn_like(log_std)
 
-    def _decode_state(self, hidden, z):
-        """(hidden, z) → state distribution"""
-        inp = torch.cat([hidden, z], dim=-1)
-        feat = self.state_decoder(inp)
-        mean = self.state_mean_head(feat)
-        log_std = self.state_logstd_head(feat).clamp(-5, 2)
-        return mean, log_std
+    # ── Delta decoder ──
+
+    def _decode_delta(self, hidden, z):
+        """(hidden, z) → Δstate (정규화 공간, clamped)"""
+        delta = self.delta_decoder(torch.cat([hidden, z], dim=-1))
+        return delta.clamp(-self.delta_clamp, self.delta_clamp)
+
+    # ── Forward (학습) ──
 
     def forward(self, past_states, future_states, contexts, world=None):
         """
-        학습 시: posterior로 z를 샘플링하면서 전체 시퀀스 처리
+        학습 시: posterior로 z 샘플링, delta 예측.
+        모든 입력/출력은 정규화 공간.
 
-        :param past_states: (B, K, STATE_DIM) 정규화된 과거 상태
-        :param future_states: (B, N, STATE_DIM) 정규화된 미래 상태
+        :param past_states: (B, K, STATE_DIM) 정규화
+        :param future_states: (B, N, STATE_DIM) 정규화
         :param contexts: (B, K+N, MAX_NEIGHBORS, CONTEXT_DIM)
-        :param world: (B, K+N, WORLD_DIM) 월드 피처 (optional)
-        :return: dict with predictions, KL losses
+        :param world: (B, K+N, WORLD_DIM) optional
         """
         B, K, _ = past_states.shape
         N = future_states.shape[1]
         T = K + N
         device = past_states.device
 
-        all_states = torch.cat([past_states, future_states], dim=1)  # (B, T, D)
+        all_states = torch.cat([past_states, future_states], dim=1)
 
-        # Initialize
         h = torch.zeros(self.gru.num_layers, B, self.hidden_dim, device=device)
         z = torch.zeros(B, self.latent_dim, device=device)
 
-        pred_means = []
-        pred_logstds = []
+        pred_deltas = []
+        target_deltas = []
         kl_losses = []
 
         for t in range(T):
-            state_t = all_states[:, t]  # (B, STATE_DIM)
-            ctx_t = contexts[:, t]  # (B, MAX_NEIGHBORS, CONTEXT_DIM)
+            state_t = all_states[:, t]
+            ctx_t = contexts[:, t]
 
-            # Encode
-            state_emb = self._encode_state(state_t)  # (B, 128)
-            interaction = self.neighbor_attn(state_emb, ctx_t)  # (B, 64)
-
-            # World encoding
+            state_emb = self._encode_state(state_t)
+            interaction = self.neighbor_attn(state_emb, ctx_t)
             world_emb = None
             if world is not None:
-                world_emb = self._encode_world(world[:, t])  # (B, 64)
+                world_emb = self._encode_world(world[:, t])
 
-            # GRU input
             gru_in = self._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
             gru_out, h = self.gru(gru_in, h)
-            h_t = gru_out.squeeze(1)  # (B, hidden_dim)
+            h_t = gru_out.squeeze(1)
 
-            # Posterior & Prior
             post_mean, post_logstd = self._posterior(h_t, state_emb)
             prior_mean, prior_logstd = self._prior(h_t)
-
-            # KL divergence
-            kl = self._kl_divergence(post_mean, post_logstd, prior_mean, prior_logstd)
-            kl_losses.append(kl)
-
-            # Sample z from posterior (training)
+            kl_losses.append(self._kl_divergence(post_mean, post_logstd,
+                                                  prior_mean, prior_logstd))
             z = self._sample_z(post_mean, post_logstd)
 
-            # Decode
-            pred_mean, pred_logstd = self._decode_state(h_t, z)
-            pred_means.append(pred_mean)
-            pred_logstds.append(pred_logstd)
+            pred_delta = self._decode_delta(h_t, z)
+            pred_deltas.append(pred_delta)
 
-        pred_means = torch.stack(pred_means, dim=1)  # (B, T, STATE_DIM)
-        pred_logstds = torch.stack(pred_logstds, dim=1)
-        kl_losses = torch.stack(kl_losses, dim=1)  # (B, T)
+            # Target delta: state[t+1] - state[t] (정규화 공간)
+            if t < T - 1:
+                tgt_delta = all_states[:, t + 1] - all_states[:, t]
+                target_deltas.append(tgt_delta)
+
+        pred_deltas = torch.stack(pred_deltas, dim=1)      # (B, T, D)
+        target_deltas = torch.stack(target_deltas, dim=1)    # (B, T-1, D)
+        kl_losses = torch.stack(kl_losses, dim=1)
 
         return {
-            'pred_mean': pred_means,        # (B, T, STATE_DIM)
-            'pred_logstd': pred_logstds,    # (B, T, STATE_DIM)
-            'kl_loss': kl_losses,           # (B, T)
-            'future_pred_mean': pred_means[:, K:],   # (B, N, STATE_DIM)
-            'future_pred_logstd': pred_logstds[:, K:],
+            'pred_deltas': pred_deltas[:, :-1],    # (B, T-1, D)
+            'target_deltas': target_deltas,          # (B, T-1, D)
+            'kl_loss': kl_losses,
         }
 
+    # ── Predict (추론) ──
+
     @torch.no_grad()
-    def predict(self, past_states, contexts_past, contexts_future_dummy=None,
+    def predict(self, past_states, contexts_past,
                 num_samples=50, future_steps=12, world_past=None):
         """
-        추론 시: prior로 미래 궤적을 Monte Carlo 샘플링
+        추론 시: prior로 미래 궤적을 MC 샘플링.
 
-        :param past_states: (B, K, STATE_DIM) 정규화된 과거 상태
+        :param past_states: (B, K, STATE_DIM) 정규화
         :param contexts_past: (B, K, MAX_NEIGHBORS, CONTEXT_DIM)
-        :param num_samples: Monte Carlo 샘플 수
-        :param future_steps: 예측할 미래 스텝 수
-        :param world_past: (B, K, WORLD_DIM) 과거 월드 피처 (optional)
-        :return: (B, num_samples, future_steps, STATE_DIM) 비정규화된 예측 궤적
+        :return: (B, num_samples, future_steps, STATE_DIM) 비정규화 예측 궤적
         """
         B, K, _ = past_states.shape
         device = past_states.device
 
-        # 과거 시퀀스 인코딩 (posterior 사용)
         h = torch.zeros(self.gru.num_layers, B, self.hidden_dim, device=device)
         z = torch.zeros(B, self.latent_dim, device=device)
 
@@ -307,43 +287,35 @@ class TrajectoryPredictor(nn.Module):
             post_mean, post_logstd = self._posterior(h_t, state_emb)
             z = self._sample_z(post_mean, post_logstd)
 
-        # 마지막 상태
-        last_state = past_states[:, -1]  # (B, STATE_DIM)
-
-        # Monte Carlo 미래 예측
-        # h, z를 num_samples로 복제
-        h_expanded = h.unsqueeze(2).expand(-1, -1, num_samples, -1).reshape(
+        # MC 확장
+        h_exp = h.unsqueeze(2).expand(-1, -1, num_samples, -1).reshape(
             self.gru.num_layers, B * num_samples, self.hidden_dim).contiguous()
-        z_expanded = z.unsqueeze(1).expand(-1, num_samples, -1).reshape(
+        z_exp = z.unsqueeze(1).expand(-1, num_samples, -1).reshape(
             B * num_samples, self.latent_dim)
-        last_pred = last_state.unsqueeze(1).expand(-1, num_samples, -1).reshape(
+
+        current_state = past_states[:, -1].unsqueeze(1).expand(-1, num_samples, -1).reshape(
             B * num_samples, STATE_DIM)
 
-        # 빈 context (미래는 context 불확실 → 0)
         empty_ctx = torch.zeros(B * num_samples, MAX_NEIGHBORS, CONTEXT_DIM, device=device)
 
         trajectories = []
+
         for t in range(future_steps):
-            state_emb = self._encode_state(last_pred)
+            state_emb = self._encode_state(current_state)
             interaction = self.neighbor_attn(state_emb, empty_ctx)
-            # 미래 스텝: world context 없음 (미래 위치 불확실)
-            gru_in = self._build_gru_input(state_emb, interaction, z_expanded).unsqueeze(1)
-            gru_out, h_expanded = self.gru(gru_in, h_expanded)
+            gru_in = self._build_gru_input(state_emb, interaction, z_exp).unsqueeze(1)
+            gru_out, h_exp = self.gru(gru_in, h_exp)
             h_t = gru_out.squeeze(1)
 
-            # Prior에서 z 샘플링
             prior_mean, prior_logstd = self._prior(h_t)
-            z_expanded = self._sample_z(prior_mean, prior_logstd)
+            z_exp = self._sample_z(prior_mean, prior_logstd)
 
-            # Decode
-            pred_mean, pred_logstd = self._decode_state(h_t, z_expanded)
-            # 샘플링 (aleatoric uncertainty)
-            pred_state = self._sample_z(pred_mean, pred_logstd)
-            trajectories.append(pred_state)
-            last_pred = pred_state
+            pred_delta = self._decode_delta(h_t, z_exp)
+            current_state = current_state + pred_delta
 
-        # (future_steps, B*num_samples, STATE_DIM) → (B, num_samples, future_steps, STATE_DIM)
-        traj = torch.stack(trajectories, dim=1)  # (B*S, T, D)
+            trajectories.append(current_state)
+
+        traj = torch.stack(trajectories, dim=1)  # (B*S, future_steps, D)
         traj = traj.view(B, num_samples, future_steps, STATE_DIM)
 
         # 비정규화
@@ -351,35 +323,26 @@ class TrajectoryPredictor(nn.Module):
 
         return traj
 
+    # ── Loss ──
+
     @staticmethod
     def _kl_divergence(mean1, logstd1, mean2, logstd2):
-        """두 가우시안 분포 사이의 KL divergence (배치별 합산)"""
         var1 = (2 * logstd1).exp()
         var2 = (2 * logstd2).exp()
         kl = 0.5 * (var1 / var2 + (mean2 - mean1).pow(2) / var2 - 1 + 2 * (logstd2 - logstd1))
-        return kl.sum(dim=-1)  # (B,) — latent_dim 차원 합산
+        return kl.sum(dim=-1)
 
-    def compute_loss(self, past_states, future_states, contexts, future_raw,
+    def compute_loss(self, past_states, future_states, contexts,
                      kl_weight=0.1, free_nats_per_step=1.0, world=None):
         """
-        학습 손실 계산
-
-        :param future_raw: (B, N, STATE_DIM) 비정규화된 미래 상태 (NM, ft 단위)
-        :param kl_weight: KL 손실 가중치
-        :param free_nats_per_step: KL free nats per timestep (DreamerV3 표준: 1.0)
-        :param world: (B, K+N, WORLD_DIM) 월드 피처 (optional)
-        :return: dict with total_loss, recon_loss, kl_loss
+        학습 loss: delta MSE + KL.
+        past_raw/future_raw 불필요 — 전부 정규화 공간에서 처리.
         """
         output = self.forward(past_states, future_states, contexts, world=world)
 
-        pred_mean = output['future_pred_mean']
-        pred_logstd = output['future_pred_logstd']
+        pred = output['pred_deltas']       # (B, T-1, D)
+        target = output['target_deltas']   # (B, T-1, D)
 
-        target = future_states
-        var = (2 * pred_logstd).exp()
-        nll = 0.5 * ((target - pred_mean).pow(2) / var + 2 * pred_logstd + math.log(2 * math.pi))
-
-        # 위치(lat, lon)와 고도에 가중치
         dim_weights = torch.ones(STATE_DIM, device=past_states.device)
         dim_weights[0] = 3.0  # lat
         dim_weights[1] = 3.0  # lon
@@ -387,13 +350,13 @@ class TrajectoryPredictor(nn.Module):
         dim_weights[3] = 1.5  # gs
         dim_weights[4] = 1.5  # track
 
-        recon_loss = (nll * dim_weights).sum(dim=-1).mean()
+        delta_err = (pred - target).pow(2) * dim_weights
+        recon_loss = delta_err.sum(dim=-1).mean()
 
-        # KL loss (free nats: T steps × per_step)
-        kl_per_step = output['kl_loss'].mean(dim=0)  # (T,)
+        K = past_states.shape[1]
+        kl_per_step = output['kl_loss'].mean(dim=0)
         T = kl_per_step.shape[0]
-        total_free_nats = free_nats_per_step * T
-        kl = torch.clamp(kl_per_step.sum() - total_free_nats, min=0)
+        kl = torch.clamp(kl_per_step.sum() - free_nats_per_step * T, min=0)
 
         total_loss = recon_loss + kl_weight * kl
 
