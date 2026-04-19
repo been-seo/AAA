@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .dataset import STATE_DIM, CONTEXT_DIM, MAX_NEIGHBORS, NORM_MEAN, NORM_STD
+from .dataset import STATE_DIM, CONTEXT_DIM, MAX_NEIGHBORS, NORM_MEAN, NORM_STD, WORLD_DIM
 
 
 class NeighborAttention(nn.Module):
@@ -96,8 +96,17 @@ class TrajectoryPredictor(nn.Module):
             query_dim=128, context_dim=CONTEXT_DIM,
             num_heads=2, out_dim=interaction_dim)
 
+        # World context encoder (waypoint features → embedding)
+        self.world_encoder = nn.Sequential(
+            nn.Linear(WORLD_DIM, 64),
+            nn.ELU(),
+            nn.Linear(64, 64),
+            nn.ELU(),
+        )
+        self.world_embed_dim = 64
+
         # GRU (deterministic path)
-        gru_input_dim = 128 + interaction_dim + latent_dim
+        gru_input_dim = 128 + interaction_dim + latent_dim + 64  # +64 world embed
         self.gru = nn.GRU(gru_input_dim, hidden_dim,
                           num_layers=num_gru_layers,
                           batch_first=True, dropout=dropout if num_gru_layers > 1 else 0)
@@ -151,6 +160,19 @@ class TrajectoryPredictor(nn.Module):
         expanded = self._deg_to_sincos(state)  # (B, 12)
         return self.state_encoder(expanded)
 
+    def _encode_world(self, world_feat):
+        """world features (B, WORLD_DIM) → embedding (B, 64)"""
+        if world_feat is None:
+            return None
+        return self.world_encoder(world_feat)
+
+    def _build_gru_input(self, state_emb, interaction, z, world_emb=None):
+        """GRU input 조합: state_emb + interaction + z + world_emb"""
+        if world_emb is None:
+            world_emb = torch.zeros(state_emb.shape[0], self.world_embed_dim,
+                                    device=state_emb.device)
+        return torch.cat([state_emb, interaction, z, world_emb], dim=-1)
+
     def _posterior(self, hidden, state_emb):
         """Posterior q(z|h, x): 관측이 있을 때의 latent"""
         inp = torch.cat([hidden, state_emb], dim=-1)
@@ -180,13 +202,14 @@ class TrajectoryPredictor(nn.Module):
         log_std = self.state_logstd_head(feat).clamp(-5, 2)
         return mean, log_std
 
-    def forward(self, past_states, future_states, contexts):
+    def forward(self, past_states, future_states, contexts, world=None):
         """
         학습 시: posterior로 z를 샘플링하면서 전체 시퀀스 처리
 
         :param past_states: (B, K, STATE_DIM) 정규화된 과거 상태
         :param future_states: (B, N, STATE_DIM) 정규화된 미래 상태
         :param contexts: (B, K+N, MAX_NEIGHBORS, CONTEXT_DIM)
+        :param world: (B, K+N, WORLD_DIM) 월드 피처 (optional)
         :return: dict with predictions, KL losses
         """
         B, K, _ = past_states.shape
@@ -212,8 +235,13 @@ class TrajectoryPredictor(nn.Module):
             state_emb = self._encode_state(state_t)  # (B, 128)
             interaction = self.neighbor_attn(state_emb, ctx_t)  # (B, 64)
 
+            # World encoding
+            world_emb = None
+            if world is not None:
+                world_emb = self._encode_world(world[:, t])  # (B, 64)
+
             # GRU input
-            gru_in = torch.cat([state_emb, interaction, z], dim=-1).unsqueeze(1)
+            gru_in = self._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
             gru_out, h = self.gru(gru_in, h)
             h_t = gru_out.squeeze(1)  # (B, hidden_dim)
 
@@ -247,7 +275,7 @@ class TrajectoryPredictor(nn.Module):
 
     @torch.no_grad()
     def predict(self, past_states, contexts_past, contexts_future_dummy=None,
-                num_samples=50, future_steps=12):
+                num_samples=50, future_steps=12, world_past=None):
         """
         추론 시: prior로 미래 궤적을 Monte Carlo 샘플링
 
@@ -255,6 +283,7 @@ class TrajectoryPredictor(nn.Module):
         :param contexts_past: (B, K, MAX_NEIGHBORS, CONTEXT_DIM)
         :param num_samples: Monte Carlo 샘플 수
         :param future_steps: 예측할 미래 스텝 수
+        :param world_past: (B, K, WORLD_DIM) 과거 월드 피처 (optional)
         :return: (B, num_samples, future_steps, STATE_DIM) 비정규화된 예측 궤적
         """
         B, K, _ = past_states.shape
@@ -269,7 +298,10 @@ class TrajectoryPredictor(nn.Module):
             ctx_t = contexts_past[:, t]
             state_emb = self._encode_state(state_t)
             interaction = self.neighbor_attn(state_emb, ctx_t)
-            gru_in = torch.cat([state_emb, interaction, z], dim=-1).unsqueeze(1)
+            world_emb = None
+            if world_past is not None:
+                world_emb = self._encode_world(world_past[:, t])
+            gru_in = self._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
             gru_out, h = self.gru(gru_in, h)
             h_t = gru_out.squeeze(1)
             post_mean, post_logstd = self._posterior(h_t, state_emb)
@@ -294,7 +326,8 @@ class TrajectoryPredictor(nn.Module):
         for t in range(future_steps):
             state_emb = self._encode_state(last_pred)
             interaction = self.neighbor_attn(state_emb, empty_ctx)
-            gru_in = torch.cat([state_emb, interaction, z_expanded], dim=-1).unsqueeze(1)
+            # 미래 스텝: world context 없음 (미래 위치 불확실)
+            gru_in = self._build_gru_input(state_emb, interaction, z_expanded).unsqueeze(1)
             gru_out, h_expanded = self.gru(gru_in, h_expanded)
             h_t = gru_out.squeeze(1)
 
@@ -327,16 +360,17 @@ class TrajectoryPredictor(nn.Module):
         return kl.sum(dim=-1)  # (B,) — latent_dim 차원 합산
 
     def compute_loss(self, past_states, future_states, contexts, future_raw,
-                     kl_weight=0.1, free_nats_per_step=1.0):
+                     kl_weight=0.1, free_nats_per_step=1.0, world=None):
         """
         학습 손실 계산
 
         :param future_raw: (B, N, STATE_DIM) 비정규화된 미래 상태 (NM, ft 단위)
         :param kl_weight: KL 손실 가중치
         :param free_nats_per_step: KL free nats per timestep (DreamerV3 표준: 1.0)
+        :param world: (B, K+N, WORLD_DIM) 월드 피처 (optional)
         :return: dict with total_loss, recon_loss, kl_loss
         """
-        output = self.forward(past_states, future_states, contexts)
+        output = self.forward(past_states, future_states, contexts, world=world)
 
         pred_mean = output['future_pred_mean']
         pred_logstd = output['future_pred_logstd']

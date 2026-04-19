@@ -21,7 +21,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
-from .dataset import STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM
+from .dataset import (STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM,
+                       WORLD_DIM, _load_waypoints, _get_nearest_waypoints)
 
 # 군용 기지 좌표 (목적지 할당용) — config.py에서 가져올 수 없으므로 직접 정의
 _DEST_COORDS = [
@@ -293,25 +294,34 @@ class Actor(nn.Module):
             nn.Linear(state_dim * 5, 256), nn.ELU(),
             nn.Linear(256, 128), nn.ELU(),
         )
+        self.world_enc = nn.Sequential(
+            nn.Linear(WORLD_DIM, 64), nn.ELU(),
+            nn.Linear(64, 64), nn.ELU(),
+        )
         self.policy_head = nn.Sequential(
-            nn.Linear(256 + 128, hidden_dim), nn.ELU(),
+            nn.Linear(256 + 128 + 64, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, NUM_ACTIONS),
         )
 
-    def forward(self, own_state, traffic_states):
+    def forward(self, own_state, traffic_states, world_feat=None):
         """
         :param own_state: (B, STATE_DIM)
         :param traffic_states: (B, 5, STATE_DIM) 가까운 5대
+        :param world_feat: (B, WORLD_DIM) 월드 피처 (optional)
         :return: (B, NUM_ACTIONS) logits
         """
         B = own_state.shape[0]
         s = self.state_enc(own_state)
         t = self.traffic_enc(traffic_states.reshape(B, -1))
-        return self.policy_head(torch.cat([s, t], dim=-1))
+        if world_feat is not None:
+            w = self.world_enc(world_feat)
+        else:
+            w = torch.zeros(B, 64, device=own_state.device)
+        return self.policy_head(torch.cat([s, t, w], dim=-1))
 
-    def get_action(self, own_state, traffic_states, deterministic=False):
-        logits = self.forward(own_state, traffic_states)
+    def get_action(self, own_state, traffic_states, deterministic=False, world_feat=None):
+        logits = self.forward(own_state, traffic_states, world_feat=world_feat)
         if deterministic:
             return logits.argmax(dim=-1)
         dist = torch.distributions.Categorical(logits=logits)
@@ -352,17 +362,25 @@ class _CriticHead(nn.Module):
             nn.Linear(state_dim * 5, 128), nn.ELU(),
             nn.Linear(128, 64), nn.ELU(),
         )
+        self.world_enc = nn.Sequential(
+            nn.Linear(WORLD_DIM, 64), nn.ELU(),
+            nn.Linear(64, 32), nn.ELU(),
+        )
         self.value_head = nn.Sequential(
-            nn.Linear(128 + 64, hidden_dim), nn.ELU(),
+            nn.Linear(128 + 64 + 32, hidden_dim), nn.ELU(),
             nn.Linear(hidden_dim, 128), nn.ELU(),
             nn.Linear(128, 1),
         )
 
-    def forward(self, own_state, traffic_states):
+    def forward(self, own_state, traffic_states, world_feat=None):
         B = own_state.shape[0]
         s = self.state_enc(own_state)
         t = self.traffic_enc(traffic_states.reshape(B, -1))
-        return self.value_head(torch.cat([s, t], dim=-1)).squeeze(-1)
+        if world_feat is not None:
+            w = self.world_enc(world_feat)
+        else:
+            w = torch.zeros(B, 32, device=own_state.device)
+        return self.value_head(torch.cat([s, t, w], dim=-1)).squeeze(-1)
 
 
 class Critic(nn.Module):
@@ -382,25 +400,25 @@ class Critic(nn.Module):
         self.mission = _CriticHead(state_dim)
         self.heads = {'safety': self.safety, 'efficiency': self.efficiency, 'mission': self.mission}
 
-    def forward(self, own_state, traffic_states, axis=None):
+    def forward(self, own_state, traffic_states, axis=None, world_feat=None):
         """axis=None이면 3축 가중합 (기본 가중치), axis 지정 시 해당 축만"""
         if axis:
-            return self.heads[axis](own_state, traffic_states)
+            return self.heads[axis](own_state, traffic_states, world_feat=world_feat)
         # 기본: safety 우선 가중합
-        s = self.safety(own_state, traffic_states)
-        e = self.efficiency(own_state, traffic_states)
-        m = self.mission(own_state, traffic_states)
+        s = self.safety(own_state, traffic_states, world_feat=world_feat)
+        e = self.efficiency(own_state, traffic_states, world_feat=world_feat)
+        m = self.mission(own_state, traffic_states, world_feat=world_feat)
         return s * 0.5 + e * 0.2 + m * 0.3
 
-    def forward_all(self, own_state, traffic_states):
+    def forward_all(self, own_state, traffic_states, world_feat=None):
         """3축 모두 반환: dict of (B,) tensors"""
         return {
-            'safety': self.safety(own_state, traffic_states),
-            'efficiency': self.efficiency(own_state, traffic_states),
-            'mission': self.mission(own_state, traffic_states),
+            'safety': self.safety(own_state, traffic_states, world_feat=world_feat),
+            'efficiency': self.efficiency(own_state, traffic_states, world_feat=world_feat),
+            'mission': self.mission(own_state, traffic_states, world_feat=world_feat),
         }
 
-    def risk_score(self, own_state, traffic_states):
+    def risk_score(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: safety V → 위험도 [0,1].
         safety는 raw space: 0=안전, -100=RA충돌. sigmoid(-V * 0.05)로 변환.
           V=0 → 0.50, V=-20 → 0.73, V=-50 → 0.92, V=-100 → 0.99
@@ -409,13 +427,13 @@ class Critic(nn.Module):
               보정으로 scale factor 0.05를 정당화해야 함.
         """
         with torch.no_grad():
-            v = self.safety(own_state, traffic_states)
+            v = self.safety(own_state, traffic_states, world_feat=world_feat)
             return torch.sigmoid(-v * 0.05).clamp(0, 1)
 
-    def axis_scores(self, own_state, traffic_states):
+    def axis_scores(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: 3축 점수 dict"""
         with torch.no_grad():
-            vals = self.forward_all(own_state, traffic_states)
+            vals = self.forward_all(own_state, traffic_states, world_feat=world_feat)
             return {
                 'safety': torch.sigmoid(-vals['safety'] * 0.05).clamp(0, 1),
                 'efficiency': torch.sigmoid(-vals['efficiency'] * 0.5).clamp(0, 1),
@@ -507,11 +525,38 @@ class DreamerTrainer:
         self.total_crashes = 0
         self.total_safe = 0
 
+        # World context (waypoints)
+        try:
+            import os
+            data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')
+            wp_data = _load_waypoints(data_dir)
+            if wp_data is not None:
+                self._wp_array, self._wp_types, self._wp_names = wp_data
+                self._has_world = True
+            else:
+                self._has_world = False
+        except Exception:
+            self._has_world = False
+
     def _denormalize(self, state_norm):
         return state_norm * self.norm_std + self.norm_mean
 
     def _normalize(self, state_raw):
         return (state_raw - self.norm_mean) / self.norm_std
+
+    def _compute_world_feat(self, states_raw):
+        """배치의 raw 상태에서 world features 계산. (B, D) → (B, WORLD_DIM)"""
+        if not self._has_world:
+            return None
+        B = states_raw.shape[0]
+        feats = []
+        for i in range(B):
+            lat = states_raw[i, 0].item()
+            lon = states_raw[i, 1].item()
+            track = states_raw[i, 4].item()
+            feat = _get_nearest_waypoints(lat, lon, track, self._wp_array, self._wp_types, k=3)
+            feats.append(feat)
+        return torch.tensor(feats, dtype=torch.float32, device=self.device)
 
     def _get_nearby_traffic(self, all_states_raw, own_idx, k=5):
         """주변 항공기 5대 추출 (거리순)"""
@@ -559,13 +604,20 @@ class DreamerTrainer:
                         device=self.device)
         z = torch.zeros(B, self.world_model.latent_dim, device=self.device)
 
+        # 초기 world context 계산 (warm-up용)
+        init_raw = self._denormalize(initial_states_norm[:, 0])
+        warmup_world_feat = self._compute_world_feat(init_raw)
+
         with torch.no_grad():
             for t in range(K):
                 state_t = initial_states_norm[:, t]
                 ctx_t = initial_contexts[:, t]
                 state_emb = self.world_model._encode_state(state_t)
                 interaction = self.world_model.neighbor_attn(state_emb, ctx_t)
-                gru_in = torch.cat([state_emb, interaction, z], dim=-1).unsqueeze(1)
+                world_emb = None
+                if warmup_world_feat is not None:
+                    world_emb = self.world_model._encode_world(warmup_world_feat)
+                gru_in = self.world_model._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
                 gru_out, h = self.world_model.gru(gru_in, h)
                 h_t = gru_out.squeeze(1)
                 post_mean, post_logstd = self.world_model._posterior(h_t, state_emb)
@@ -666,6 +718,9 @@ class DreamerTrainer:
         for step in range(self.horizon):
             own_norm = self._normalize(current_own_raw)  # (B, D)
 
+            # World context 계산 (현재 위치 기반)
+            world_feat = self._compute_world_feat(current_own_raw)
+
             # 이 스텝의 트래픽 (정규화)
             step_traffic_raw = traffic_env[:, step]  # (B, N_traffic, D)
             step_traffic_norm = (step_traffic_raw - self.norm_mean) / self.norm_std
@@ -673,12 +728,12 @@ class DreamerTrainer:
 
             # Critic value
             with torch.no_grad():
-                vals = self.target_critic.forward_all(own_norm, step_traffic_norm)
+                vals = self.target_critic.forward_all(own_norm, step_traffic_norm, world_feat=world_feat)
             for ax in REWARD_AXES:
                 all_values[ax].append(vals[ax])
 
             # Actor action (내 항공기 기준, 트래픽 참조)
-            action = self.actor.get_action(own_norm, step_traffic_norm)
+            action = self.actor.get_action(own_norm, step_traffic_norm, world_feat=world_feat)
             all_actions.append(action)
 
             # 내 항공기에 행동 반영 (target 방식)
@@ -698,7 +753,10 @@ class DreamerTrainer:
             with torch.no_grad():
                 state_emb = self.world_model._encode_state(modified_norm)
                 interaction = self.world_model.neighbor_attn(state_emb, empty_ctx)
-                gru_in = torch.cat([state_emb, interaction, z], dim=-1).unsqueeze(1)
+                world_emb = None
+                if world_feat is not None:
+                    world_emb = self.world_model._encode_world(world_feat)
+                gru_in = self.world_model._build_gru_input(state_emb, interaction, z, world_emb).unsqueeze(1)
                 gru_out, h = self.world_model.gru(gru_in, h)
                 h_t = gru_out.squeeze(1)
                 prior_mean, prior_logstd = self.world_model._prior(h_t)
@@ -751,8 +809,10 @@ class DreamerTrainer:
         # 마지막 value (bootstrap)
         own_norm_final = self._normalize(current_own_raw)
         final_traffic_norm = (traffic_env[:, -1] - self.norm_mean) / self.norm_std
+        final_world_feat = self._compute_world_feat(current_own_raw)
         with torch.no_grad():
-            final_vals = self.target_critic.forward_all(own_norm_final, final_traffic_norm)
+            final_vals = self.target_critic.forward_all(own_norm_final, final_traffic_norm,
+                                                        world_feat=final_world_feat)
 
         return {
             'states': torch.stack(all_states, dim=1),
@@ -819,6 +879,12 @@ class DreamerTrainer:
         N_t = traffic_all.shape[2]
         traffic_flat = traffic_all.reshape(B * H, N_t, STATE_DIM)  # (B*H, N_traffic, D)
 
+        # ── World features for flat batch ──
+        world_flat = None
+        if self._has_world:
+            own_raw_flat = own_states.reshape(B * H, D)
+            world_flat = self._compute_world_feat(own_raw_flat)
+
         # ── 각 Critic head 독립 학습 (독립 optimizer) ──
         critic_losses = {}
         targets_per_axis = {}
@@ -831,7 +897,7 @@ class DreamerTrainer:
                 # symlog space
                 targets = torch.nan_to_num(raw_targets, nan=0.0).clamp(-10, 10)
             targets_per_axis[ax] = targets
-            pred = self.critic.heads[ax](own_flat, traffic_flat)
+            pred = self.critic.heads[ax](own_flat, traffic_flat, world_feat=world_flat)
             loss = F.mse_loss(pred, targets)
             critic_losses[ax] = loss.item()
 
@@ -846,7 +912,7 @@ class DreamerTrainer:
 
         # ── Actor 업데이트: PAVING (φ = ΣL_k 단순 합산) ──
         # Inner task가 직교하면 gradient conflict 없음 (CANON, Remark 1)
-        logits = self.actor(own_flat, traffic_flat)
+        logits = self.actor(own_flat, traffic_flat, world_feat=world_flat)
         logits = torch.nan_to_num(logits, nan=0.0).clamp(-20, 20)
         dist = torch.distributions.Categorical(logits=logits)
         actions_flat = rollout['actions'].reshape(B * H)
@@ -858,7 +924,7 @@ class DreamerTrainer:
         advs = {}
         for ax in REWARD_AXES:
             with torch.no_grad():
-                v = self.critic.heads[ax](own_flat, traffic_flat)
+                v = self.critic.heads[ax](own_flat, traffic_flat, world_feat=world_flat)
             adv = (targets_per_axis[ax] - v).detach()
             adv = torch.nan_to_num(adv, nan=0.0)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)

@@ -100,10 +100,15 @@ def train_epoch(model, loader, optimizer, device, kl_weight=0.1, grad_clip=100.0
     n_batches = 0
 
     for batch in loader:
-        past, future, ctx, mask, future_raw = [x.to(device) for x in batch]
+        batch_gpu = [x.to(device) for x in batch]
+        if len(batch_gpu) == 6:
+            past, future, ctx, mask, future_raw, world = batch_gpu
+        else:
+            past, future, ctx, mask, future_raw = batch_gpu
+            world = None
 
         losses = model.compute_loss(past, future, ctx, future_raw,
-                                    kl_weight=kl_weight)
+                                    kl_weight=kl_weight, world=world)
 
         optimizer.zero_grad()
         losses['total_loss'].backward()
@@ -134,17 +139,22 @@ def validate(model, loader, device, kl_weight=0.1):
     position_errors = []
 
     for batch in loader:
-        past, future, ctx, mask, future_raw = [x.to(device) for x in batch]
+        batch_gpu = [x.to(device) for x in batch]
+        if len(batch_gpu) == 6:
+            past, future, ctx, mask, future_raw, world = batch_gpu
+        else:
+            past, future, ctx, mask, future_raw = batch_gpu
+            world = None
 
         losses = model.compute_loss(past, future, ctx, future_raw,
-                                    kl_weight=kl_weight)
+                                    kl_weight=kl_weight, world=world)
 
         total_loss += losses['total_loss'].item()
         total_recon += losses['recon_loss'].item()
         total_kl += losses['kl_loss'].item()
 
         # 위치 오차 계산 (비정규화 공간)
-        output = model(past, future, ctx)
+        output = model(past, future, ctx, world=world)
         pred_mean = output['future_pred_mean']  # (B, N, D) 정규화됨
         # 비정규화
         pred_raw = pred_mean * model.norm_std + model.norm_mean

@@ -38,6 +38,12 @@ CONTEXT_DIM = 6
 MAX_NEIGHBORS = 8
 NEIGHBOR_RADIUS_NM = 50.0
 
+# World context: 가장 가까운 K개 웨이포인트
+MAX_NEAREST_WP = 3
+WP_FEAT_DIM = 4  # dx_nm, dy_nm, type_id, bearing_offset
+WORLD_DIM = MAX_NEAREST_WP * WP_FEAT_DIM  # 12
+WP_TYPE_MAP = {"VORTAC": 1.0, "VOR": 0.8, "TACAN": 0.6, "FIX": 0.4, "FIR_BDRY": 0.2}
+
 
 def _haversine_nm(lat1, lon1, lat2, lon2):
     R = 3440.065
@@ -74,6 +80,47 @@ def _get_neighbor_context(target_icao, target_state, ac_rows, max_n=MAX_NEIGHBOR
     for i, (_, vec) in enumerate(neighbors[:max_n]):
         ctx[i] = vec
     return ctx
+
+
+def _load_waypoints(data_dir):
+    """ats_routes_named.json에서 웨이포인트 로드."""
+    wp_path = Path(data_dir) / "ats_routes_named.json"
+    if not wp_path.exists():
+        # data_dir의 부모도 시도 (recordings → data)
+        wp_path = Path(data_dir).parent / "ats_routes_named.json"
+    if not wp_path.exists():
+        print(f"[Dataset] WARNING: ats_routes_named.json not found, world context disabled")
+        return None
+    with open(wp_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    waypoints = data["waypoints"]
+    wp_array = np.array([[w["lat"], w["lon"]] for w in waypoints], dtype=np.float64)
+    wp_types = np.array([WP_TYPE_MAP.get(w["type"], 0.0) for w in waypoints], dtype=np.float32)
+    wp_names = [w["name"] for w in waypoints]
+    print(f"[Dataset] Loaded {len(waypoints)} waypoints from {wp_path.name}")
+    return wp_array, wp_types, wp_names
+
+
+def _get_nearest_waypoints(lat, lon, track_deg, wp_array, wp_types, k=MAX_NEAREST_WP):
+    """항공기 위치에서 가장 가까운 K개 웨이포인트 피처 반환.
+    Returns: (k * WP_FEAT_DIM,) = (12,) array
+    """
+    feat = np.zeros(k * WP_FEAT_DIM, dtype=np.float32)
+    cos_lat = math.cos(math.radians(lat))
+    dx_all = (wp_array[:, 1] - lon) * 60.0 * cos_lat
+    dy_all = (wp_array[:, 0] - lat) * 60.0
+    dist_sq = dx_all**2 + dy_all**2
+    nearest_idx = np.argpartition(dist_sq, min(k, len(dist_sq) - 1))[:k]
+    nearest_idx = nearest_idx[np.argsort(dist_sq[nearest_idx])]
+    for i, idx in enumerate(nearest_idx):
+        dx_nm, dy_nm = dx_all[idx], dy_all[idx]
+        wp_bearing = math.degrees(math.atan2(dx_nm, dy_nm)) % 360
+        bearing_offset = ((wp_bearing - track_deg + 180) % 360 - 180) / 180.0
+        feat[i * WP_FEAT_DIM + 0] = dx_nm / 100.0
+        feat[i * WP_FEAT_DIM + 1] = dy_nm / 100.0
+        feat[i * WP_FEAT_DIM + 2] = wp_types[idx]
+        feat[i * WP_FEAT_DIM + 3] = bearing_offset
+    return feat
 
 
 def _interpolate_nans(states):
@@ -115,6 +162,14 @@ class TrajectoryDataset(Dataset):
         # 인덱스: [(db_path, icao24, [snapshot_id_window])]
         self.index = []
         self._db_paths = []
+
+        # World context: 웨이포인트
+        wp_data = _load_waypoints(data_dir)
+        if wp_data is not None:
+            self._wp_array, self._wp_types, self._wp_names = wp_data
+            self._has_world = True
+        else:
+            self._has_world = False
 
         self._build_index(max_files)
 
@@ -197,9 +252,12 @@ class TrajectoryDataset(Dataset):
 
     def __getitem__(self, idx):
         if getattr(self, '_preloaded', False):
-            return (self._cache_past[idx], self._cache_future[idx],
-                    self._cache_ctx[idx], self._cache_msk[idx],
-                    self._cache_future_raw[idx])
+            items = (self._cache_past[idx], self._cache_future[idx],
+                     self._cache_ctx[idx], self._cache_msk[idx],
+                     self._cache_future_raw[idx])
+            if self._has_world:
+                items = items + (self._cache_world[idx],)
+            return items
         return self._load_item(idx)
 
     def get_norm_params(self):
@@ -234,6 +292,12 @@ class TrajectoryDataset(Dataset):
                     self._cache_ctx = cache['ctx']
                     self._cache_msk = cache['msk']
                     self._cache_future_raw = cache['future_raw']
+                    if self._has_world and 'world' in cache:
+                        self._cache_world = cache['world']
+                    elif self._has_world:
+                        # 캐시에 world 없음 — 리빌드 필요
+                        print(f"[Dataset] Cache missing world, rebuilding...")
+                        raise ValueError("rebuild")
                     self._preloaded = True
                     mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
                              self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
@@ -247,33 +311,43 @@ class TrajectoryDataset(Dataset):
                     self._cache_ctx = torch.zeros(N, self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM)
                     self._cache_msk = torch.zeros(N, self.total_steps, STATE_DIM)
                     self._cache_future_raw = torch.zeros(N, self.future_steps, STATE_DIM)
+                    if self._has_world:
+                        self._cache_world = torch.zeros(N, self.total_steps, WORLD_DIM)
                     # 기존 캐시 복사
                     self._cache_past[:cached_n] = cache['past']
                     self._cache_future[:cached_n] = cache['future']
                     self._cache_ctx[:cached_n] = cache['ctx']
                     self._cache_msk[:cached_n] = cache['msk']
                     self._cache_future_raw[:cached_n] = cache['future_raw']
+                    if self._has_world and 'world' in cache:
+                        self._cache_world[:cached_n] = cache['world']
                     self._preloaded = True
                     del cache
                     print(f"[Dataset] Loaded {cached_n} cached, training can start")
                     # 나머지를 백그라운드에서 빌드
                     def _bg_build():
                         for i in range(cached_n, N):
-                            past, future, ctx, msk, future_raw = self._load_item(i)
+                            item = self._load_item(i)
+                            past, future, ctx, msk, future_raw = item[:5]
                             self._cache_past[i] = past
                             self._cache_future[i] = future
                             self._cache_ctx[i] = ctx
                             self._cache_msk[i] = msk
                             self._cache_future_raw[i] = future_raw
+                            if self._has_world and len(item) == 6:
+                                self._cache_world[i] = item[5]
                             if (i + 1 - cached_n) % 5000 == 0:
                                 print(f"[Dataset BG] {i+1}/{N} ({i+1-cached_n} new)")
                         print(f"[Dataset BG] Complete: {N} samples")
                         try:
-                            torch.save({
+                            save_dict = {
                                 'n': N, 'past': self._cache_past, 'future': self._cache_future,
                                 'ctx': self._cache_ctx, 'msk': self._cache_msk,
                                 'future_raw': self._cache_future_raw,
-                            }, cache_path)
+                            }
+                            if self._has_world:
+                                save_dict['world'] = self._cache_world
+                            torch.save(save_dict, cache_path)
                             sz = os.path.getsize(cache_path) / 1024 / 1024
                             print(f"[Dataset BG] Cache saved ({sz:.0f}MB)")
                         except Exception as e:
@@ -293,14 +367,19 @@ class TrajectoryDataset(Dataset):
         self._cache_ctx = torch.zeros(N, self.total_steps, MAX_NEIGHBORS, CONTEXT_DIM)
         self._cache_msk = torch.zeros(N, self.total_steps, STATE_DIM)
         self._cache_future_raw = torch.zeros(N, self.future_steps, STATE_DIM)
+        if self._has_world:
+            self._cache_world = torch.zeros(N, self.total_steps, WORLD_DIM)
 
         for i in range(N):
-            past, future, ctx, msk, future_raw = self._load_item(i)
+            item = self._load_item(i)
+            past, future, ctx, msk, future_raw = item[:5]
             self._cache_past[i] = past
             self._cache_future[i] = future
             self._cache_ctx[i] = ctx
             self._cache_msk[i] = msk
             self._cache_future_raw[i] = future_raw
+            if self._has_world and len(item) == 6:
+                self._cache_world[i] = item[5]
             if (i + 1) % 5000 == 0:
                 mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
                          self._cache_ctx, self._cache_msk, self._cache_future_raw]) / 1024 / 1024
@@ -312,15 +391,26 @@ class TrajectoryDataset(Dataset):
         print(f"[Dataset] Preload complete: {N} samples, {mb:.0f}MB")
 
         try:
-            torch.save({
+            save_dict = {
                 'n': N, 'past': self._cache_past, 'future': self._cache_future,
                 'ctx': self._cache_ctx, 'msk': self._cache_msk,
                 'future_raw': self._cache_future_raw,
-            }, cache_path)
+            }
+            if self._has_world:
+                save_dict['world'] = self._cache_world
+            torch.save(save_dict, cache_path)
             sz = os.path.getsize(cache_path) / 1024 / 1024
             print(f"[Dataset] Cache saved: {cache_path} ({sz:.0f}MB)")
         except Exception as e:
             print(f"[Dataset] Cache save failed: {e}")
+
+    @property
+    def world_dim(self):
+        return WORLD_DIM if self._has_world else 0
+
+    @property
+    def has_world(self):
+        return self._has_world
 
     def _load_item(self, idx):
         """DB에서 단일 샘플 로드 (원래 __getitem__ 로직)."""
@@ -368,5 +458,14 @@ class TrajectoryDataset(Dataset):
         ctx = torch.from_numpy(contexts)
         msk = torch.from_numpy(mask.astype(np.float32))
         future_raw = torch.from_numpy(states[self.past_steps:].copy())
+
+        if self._has_world:
+            world = np.zeros((self.total_steps, WORLD_DIM), dtype=np.float32)
+            for i in range(self.total_steps):
+                lat, lon, track = states[i, 0], states[i, 1], states[i, 4]
+                world[i] = _get_nearest_waypoints(
+                    lat, lon, track, self._wp_array, self._wp_types)
+            world_t = torch.from_numpy(world)
+            return past, future, ctx, msk, future_raw, world_t
 
         return past, future, ctx, msk, future_raw
