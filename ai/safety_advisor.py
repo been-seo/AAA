@@ -275,14 +275,14 @@ class SafetyAdvisor:
                 sep_detail = f"{nearest_cs} {nearest_dist:.1f}NM/{alt_diff:.0f}ft"
             factors['separation'] = (sep_risk, sep_detail)
 
-            # 2. Convergence (수렴 위험) — heading alignment
+            # 2. Convergence (근접 예상) — heading alignment + closing rate
             conv_risk = 0.0
             conv_detail = ""
             if k > 0:
                 nearest_idx = indices[0].item()
                 nearest_ac = ac_list[nearest_idx]
                 nearest_dist = dists_nm[ui, nearest_idx].item()
-                if nearest_dist < 20:
+                if nearest_dist < 30:
                     bearing_to = math.degrees(math.atan2(
                         nearest_ac.lon - uac.lon,
                         nearest_ac.lat - uac.lat)) % 360
@@ -296,8 +296,26 @@ class SafetyAdvisor:
                     dist_factor = max(0, (20 - nearest_dist) / 20.0)
                     conv_risk *= dist_factor
                     nearest_cs = getattr(nearest_ac, 'callsign', '') or getattr(nearest_ac, 'icao24', '?')
+
+                    # 접근률 (NM/min) — 10초 외삽
+                    cr = self._closing_rate(uac, nearest_ac, nearest_dist) if hasattr(uac, 'hdg_current') else 0
+                    cr_nmmin = cr * 60  # NM/s → NM/min
+
+                    # 예상 CPA (최근접 시간/거리)
+                    if cr > 0.001:
+                        cpa_time_sec = nearest_dist / cr
+                        cpa_time_min = cpa_time_sec / 60
+                    else:
+                        cpa_time_min = 999
+
                     if conv_risk > 0.1:
-                        conv_detail = f"{nearest_cs} BRG{bearing_to:.0f} ANGLE{approach_angle:.0f}"
+                        parts = [nearest_cs]
+                        if cr_nmmin > 0.5:
+                            parts.append(f"접근{cr_nmmin:.0f}NM/min")
+                        if cpa_time_min < 30:
+                            parts.append(f"약{cpa_time_min:.0f}분후")
+                        parts.append(f"{nearest_dist:.0f}NM")
+                        conv_detail = " ".join(parts)
             factors['convergence'] = (conv_risk, conv_detail)
 
             # 3. Altitude (고도 위험)
@@ -373,11 +391,32 @@ class SafetyAdvisor:
             if af > 0.05:
                 inner_parts.append(f"최저고도:{af:.0%}({alt_val:.0f}ft)")
 
-            inner_detail = " | ".join(inner_parts) if inner_parts else ""
+            # AI Safety 종합 — WM 예측 + 룰 요인 통합
+            detail_parts = []
 
-            # AI 축 점수 (inner task 세부가 있을 때만 표시)
-            if inner_parts:
-                factors['ai_safety'] = (ai_safety, inner_detail)
+            # WM 충돌 예측 (ConflictDetector 결과)
+            if self._conflict_detector:
+                cs = getattr(uac, 'callsign', '')
+                for pred in getattr(self, '_last_wm_predictions', []):
+                    if cs in (pred.icao_a, pred.icao_b) and pred.probability >= 0.1:
+                        other = pred.icao_b if pred.icao_a == cs else pred.icao_a
+                        detail_parts.append(
+                            f"WM:{pred.probability:.0%}({other} "
+                            f"{pred.expected_time_sec:.0f}초후 "
+                            f"{pred.min_h_dist_nm:.1f}NM)")
+
+            # 룰 기반 요인
+            if sep_risk > 0.05:
+                detail_parts.append(f"분리:{sep_risk:.0%}")
+            if conv_risk > 0.05:
+                detail_parts.append(f"근접예상:{conv_risk:.0%}")
+            if alt_risk > 0.05:
+                detail_parts.append(f"고도:{alt_risk:.0%}")
+            if spd_risk > 0.05:
+                detail_parts.append(f"속도:{spd_risk:.0%}")
+            ai_detail = " | ".join(detail_parts) if detail_parts else ""
+            factors['ai_safety'] = (ai_safety, ai_detail)
+
             if ai_efficiency >= 0.8:
                 factors['ai_efficiency'] = (ai_efficiency, "")
             if ai_mission >= 0.8:
@@ -404,7 +443,7 @@ class SafetyAdvisor:
                 label = {
                     'separation': 'SEP', 'convergence': 'CONV',
                     'altitude': 'ALT', 'speed': 'SPD',
-                    'ai_safety': 'AI:S', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
+                    'ai_safety': 'AI Safety', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
                 }.get(fname, fname)
                 line = f"{label} {frisk:.0%}"
                 if fdetail:
@@ -1207,6 +1246,7 @@ class SafetyAdvisor:
             # Conflict 예측 실행
             predictions = self._conflict_detector.detect(
                 dt_sec=10.0, past_steps=6, min_prob=0.1)
+            self._last_wm_predictions = predictions  # AI:S 세부 표시용 캐싱
 
             for pred in predictions:
                 # 관제사가 관리하는 항공기가 관련된 경우만

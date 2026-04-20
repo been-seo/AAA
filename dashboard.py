@@ -43,6 +43,7 @@ HTML = """
   <div class="card"><h3>V Values (Safety / Efficiency / Mission)</h3><canvas id="valueChart"></canvas></div>
   <div class="card"><h3>Axis Rewards (Safety / Efficiency / Mission)</h3><canvas id="axisRewardChart"></canvas></div>
   <div class="card"><h3>Entropy</h3><canvas id="entropyChart"></canvas></div>
+  <div class="card"><h3>Critic: V_crash vs V_safe</h3><canvas id="vcvsChart"></canvas></div>
 </div>
 
 <script>
@@ -79,6 +80,12 @@ function initCharts() {
   entropyChart = new Chart(document.getElementById('entropyChart'), {
     type: 'line', data: { labels: [], datasets: [{ label: 'Entropy', data: [], borderColor: '#ff9800', borderWidth: 2, pointRadius: 0 }] }, options: chartOpts
   });
+  vcvsChart = new Chart(document.getElementById('vcvsChart'), {
+    type: 'line', data: { labels: [], datasets: [
+      { label: 'V_crash', data: [], borderColor: '#f44336', borderWidth: 2, pointRadius: 0 },
+      { label: 'V_safe', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0 },
+    ] }, options: chartOpts
+  });
 }
 
 async function update() {
@@ -107,6 +114,13 @@ async function update() {
     entropyChart.data.labels = labels;
     entropyChart.data.datasets[0].data = d.entropy;
     entropyChart.update();
+
+    if (d.v_crash) {
+      vcvsChart.data.labels = labels;
+      vcvsChart.data.datasets[0].data = d.v_crash;
+      vcvsChart.data.datasets[1].data = d.v_safe;
+      vcvsChart.update();
+    }
 
     const last = d.steps.length - 1;
     const cr = d.crash_rate[last].toFixed(1);
@@ -157,7 +171,9 @@ def api_data():
                COALESCE(v_mission, -10) as vm,
                COALESCE(r_safety, 0) as rs,
                COALESCE(r_efficiency, 0) as re,
-               COALESCE(r_mission, 0) as rm
+               COALESCE(r_mission, 0) as rm,
+               COALESCE(v_crash, 0) as vcr,
+               COALESCE(v_safe, 0) as vsf
         FROM dreamer_steps
         WHERE step % {skip * 10} = 0
         ORDER BY step
@@ -166,10 +182,11 @@ def api_data():
 
     steps, crash_rate, v_safety, v_efficiency, v_mission = [], [], [], [], []
     r_safety, r_efficiency, r_mission = [], [], []
+    v_crash_list, v_safe_list = [], []
     entropy, episodes = [], []
 
     for r in rows:
-        step, mean_r, mean_v, crashes, ent, tot_ep, tot_cr, tot_safe, vs, ve, vm, rs, re, rm = r
+        step, mean_r, mean_v, crashes, ent, tot_ep, tot_cr, tot_safe, vs, ve, vm, rs, re, rm, vcr, vsf = r
         steps.append(step)
         cr = (tot_cr / max(tot_ep, 1)) * 100
         crash_rate.append(round(cr, 2))
@@ -179,6 +196,8 @@ def api_data():
         r_safety.append(round(rs, 2))
         r_efficiency.append(round(re, 2))
         r_mission.append(round(rm, 2))
+        v_crash_list.append(round(vcr, 2))
+        v_safe_list.append(round(vsf, 2))
         entropy.append(round(ent, 2))
         episodes.append(tot_ep)
 
@@ -186,6 +205,7 @@ def api_data():
         'steps': steps, 'crash_rate': crash_rate,
         'v_safety': v_safety, 'v_efficiency': v_efficiency, 'v_mission': v_mission,
         'r_safety': r_safety, 'r_efficiency': r_efficiency, 'r_mission': r_mission,
+        'v_crash': v_crash_list, 'v_safe': v_safe_list,
         'entropy': entropy, 'episodes': episodes,
     })
 

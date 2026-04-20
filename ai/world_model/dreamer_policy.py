@@ -981,12 +981,18 @@ class DreamerTrainer:
 
         # 통계
         safety_r = rollout['rewards']['safety'].sum(dim=1).mean().item()
-        crashes = (rollout['rewards']['safety'] < -30).any(dim=1).sum().item()
+        crash_mask = (rollout['rewards']['safety'] < -30).any(dim=1)  # (B,)
+        crashes = crash_mask.sum().item()
         self.total_episodes += B
         self.total_crashes += crashes
         self.total_safe += B - crashes
 
         mean_v = {ax: rollout['values'][ax].mean().item() for ax in REWARD_AXES}
+
+        # Critic 판별력: crash/safe 에피소드별 V 분리
+        v_safety_all = rollout['values']['safety'].mean(dim=1)  # (B,)
+        v_crash = v_safety_all[crash_mask].mean().item() if crashes > 0 else 0.0
+        v_safe = v_safety_all[~crash_mask].mean().item() if crashes < B else 0.0
 
         # 축별 보상 합계
         r_sums = {ax: rollout['rewards'][ax].sum(dim=1).mean().item() for ax in REWARD_AXES}
@@ -1011,6 +1017,8 @@ class DreamerTrainer:
             'certificate_h': cert_h,
             'max_cos_sim': max_cos_sim,
             'crashes': crashes,
+            'v_crash': v_crash,
+            'v_safe': v_safe,
             'entropy': entropy.item(),
         }
 
