@@ -333,31 +333,36 @@ class SafetyAdvisor:
             factors['speed'] = (spd_risk, spd_detail)
 
             # ── Inner Task 위험도 (Dreamer 보상 함수 기준) ──
+            inner_parts = []
             if k > 0:
                 nearest_idx = indices[0].item()
                 nearest_dist = dists_nm[ui, nearest_idx].item()
                 nearest_ac = ac_list[nearest_idx]
                 alt_diff = abs(uac.alt_current - nearest_ac.alt_current)
 
-                # sep_h: 수평 분리 (5NM=100%, 10NM=50%, 15NM이상=0%)
+                # sep_h
                 if nearest_dist < 5.0:
                     sep_h = 1.0
                 elif nearest_dist < 15.0:
                     sep_h = (15.0 - nearest_dist) / 10.0
                 else:
                     sep_h = 0.0
-                factors['inner:sep_h'] = (sep_h, f"{nearest_dist:.1f}NM")
+                if sep_h > 0.05:
+                    nearest_cs = getattr(nearest_ac, 'callsign', '') or getattr(nearest_ac, 'icao24', '?')
+                    inner_parts.append(f"수평분리:{sep_h:.0%}({nearest_cs} {nearest_dist:.1f}NM)")
 
-                # sep_v: 수직 분리 (500ft=100%, 1000ft=50%, 2000ft이상=0%)
+                # sep_v
                 if alt_diff < 500:
                     sep_v = 1.0
                 elif alt_diff < 2000:
                     sep_v = (2000 - alt_diff) / 1500.0
                 else:
                     sep_v = 0.0
-                factors['inner:sep_v'] = (sep_v, f"{alt_diff:.0f}ft")
+                if sep_v > 0.05:
+                    nearest_cs = getattr(nearest_ac, 'callsign', '') or getattr(nearest_ac, 'icao24', '?')
+                    inner_parts.append(f"수직분리:{sep_v:.0%}({nearest_cs} {alt_diff:.0f}ft)")
 
-            # alt_floor: 최저 안전 고도 (2000ft=100%, 5000ft=0%)
+            # alt_floor
             alt_val = uac.alt_current
             if alt_val < 2000:
                 af = 1.0
@@ -365,10 +370,14 @@ class SafetyAdvisor:
                 af = (5000 - alt_val) / 3000.0
             else:
                 af = 0.0
-            factors['inner:alt_floor'] = (af, f"{alt_val:.0f}ft")
+            if af > 0.05:
+                inner_parts.append(f"최저고도:{af:.0%}({alt_val:.0f}ft)")
 
-            # AI 축 점수 추가 (efficiency/mission은 80% 이상일 때만)
-            factors['ai_safety'] = (ai_safety, "")
+            inner_detail = " | ".join(inner_parts) if inner_parts else ""
+
+            # AI 축 점수 (inner task 세부가 있을 때만 표시)
+            if inner_parts:
+                factors['ai_safety'] = (ai_safety, inner_detail)
             if ai_efficiency >= 0.8:
                 factors['ai_efficiency'] = (ai_efficiency, "")
             if ai_mission >= 0.8:
@@ -395,8 +404,6 @@ class SafetyAdvisor:
                 label = {
                     'separation': 'SEP', 'convergence': 'CONV',
                     'altitude': 'ALT', 'speed': 'SPD',
-                    'inner:sep_h': 'IT:수평분리', 'inner:sep_v': 'IT:수직분리',
-                    'inner:alt_floor': 'IT:최저고도',
                     'ai_safety': 'AI:S', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
                 }.get(fname, fname)
                 line = f"{label} {frisk:.0%}"
