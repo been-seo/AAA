@@ -206,13 +206,45 @@ def analyze(model_path, data_dir='data/recordings', batch_size=256,
             marker = " ←heading redundancy"
         print(f"  |cos({a:<15}, {b:<15})| = {c:.3f}{marker}")
 
+    # ═══════════════════════════════════════════
+    # 5. Overall Gram condition number (K×K)
+    # ═══════════════════════════════════════════
+    print("\n" + "=" * 72)
+    print(f"FULL K={K} GRAM CONDITION NUMBER")
+    print("=" * 72)
+    full_eigs = np.linalg.eigvalsh(gram)
+    full_eigs_clipped = np.clip(full_eigs, 1e-9, None)
+    print(f"  Eigenvalues: {full_eigs}")
+    print(f"  σ_min: {full_eigs_clipped.min():.4f}")
+    print(f"  σ_max: {full_eigs_clipped.max():.4f}")
+    print(f"  κ(G):  {full_eigs_clipped.max() / full_eigs_clipped.min():.2f}")
+    print(f"  (PAVING target κ ≈ 1 for orthogonal task decomposition)")
+
+    # 사후 검증: PAVING τ=0.5 기준 위반 pair 체크
+    print("\n" + "=" * 72)
+    print("PAVING TAU=0.5 VIOLATIONS (|cos| > 0.5)")
+    print("=" * 72)
+    violations = [(p, c) for p, c in pairs if c > 0.5]
+    if violations:
+        for (a, b), c in violations:
+            print(f"  ⚠ |cos({a}, {b})| = {c:.3f} > 0.5")
+        print(f"  → K reduction needed or PAVING controller regroup")
+    else:
+        print(f"  ✓ All {len(pairs)} pairs within τ=0.5")
+        print(f"  → PAVING controller safe to enable")
+
     # Save to JSON for paper
     import json
     out = {
         'model': model_path,
         'n_batches': n_batches_done,
         'task_names': task_names,
+        'K': K,
         'gram': gram.tolist(),
+        'full_gram_kappa': float(full_eigs_clipped.max() / full_eigs_clipped.min()),
+        'tau_violations': [
+            {'pair': list(p), 'abs_cos': float(c)} for p, c in violations
+        ],
         'heading_trio': {
             'tasks': heading_tasks,
             'sub_gram': sub.tolist() if len(heading_idx) == 3 else None,

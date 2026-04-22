@@ -391,15 +391,33 @@ class TrajectoryPredictor(nn.Module):
         kl = 0.5 * (var1 / var2 + (mean2 - mean1).pow(2) / var2 - 1 + 2 * (logstd2 - logstd1))
         return kl.sum(dim=-1)
 
-    # ── Inner task 이름 (PAVING K=9, redundancy 제거) ──
-    # 실측 gradient cos 분석 결과 (models/world_model/gradient_redundancy.json):
-    #   - heading_circ와 track_sin: |cos|=0.776 → 중복, 제거
-    #   - kl: gradient ≈ 0 (free_nats clamp), inner task 자격 없음 — 별도 regularizer
+    # ── Inner task 이름 (PAVING K=9) ──
+    # Gradient redundancy 분석 (models/world_model/gradient_redundancy.json):
+    #
+    # heading_circ 제거 근거 (구조적 아님, 분포적):
+    #   소오차 근사에서:
+    #     ∂L_heading_circ/∂θ ∝ Δθ
+    #     ∂L_track_sin/∂θ    ∝ 2·cos²θ · Δθ
+    #     ∂L_track_cos/∂θ    ∝ 2·sin²θ · Δθ
+    #   따라서 cos(∇heading_circ, ∇track_sin) ∝ E[Δθ²·cos²θ]
+    #         cos(∇heading_circ, ∇track_cos) ∝ E[Δθ²·sin²θ]
+    #   한국 ATS 항로는 KADIZ 기준 대부분 N-S 축(B576, A593, Y722)이라
+    #   θ ≈ 0 또는 π → cos²θ ≈ 1, sin²θ ≈ 0.
+    #   측정값 0.776 / 0.041 비율이 이 분포의 직접 귀결.
+    #   → 현 데이터셋 한정 heading_circ ⊂ span(track_sin)에 근접.
+    #   wraparound(350°↔10°) 극단에서는 heading_circ만 정확하지만,
+    #   현 학습 분포에서는 track_sin/cos 2개로 충분.
+    #
+    # kl 제거 근거 (구조적):
+    #   free_nats clamp로 KL < floor 일 때 gradient 0.
+    #   ‖∇L_kl‖² = 0 → Gram row/col 0 → degenerate task.
+    #   PAVING CANON의 non-degenerate task 전제와 부합하지 않으므로
+    #   inner task에서 제외하고 별도 regularizer(kl_weight)로 분리.
     INNER_TASKS = [
         'pos_lat', 'pos_lon',      # Position (2)
         'alt', 'vrate',             # Vertical (2)
-        'gs', 'ias', 'mach',        # Speed (3; ias/mach는 |cos|=0.33 관찰)
-        'track_sin', 'track_cos',  # Heading circular (2, 직교 확인)
+        'gs', 'ias', 'mach',        # Speed (3; |cos|=0.33 < τ=0.5, 독립 유지)
+        'track_sin', 'track_cos',  # Heading circular (2, |cos|=0.028 직교)
     ]
 
     def compute_loss(self, past_states, future_states, contexts,
