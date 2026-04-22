@@ -399,8 +399,8 @@ class TrajectoryPredictor(nn.Module):
     ]
 
     def compute_loss(self, past_states, future_states, contexts,
-                     kl_weight=0.1, free_nats_per_step=1.0, world=None,
-                     kl_min_nats=0.5, task_weights=None):
+                     kl_weight=0.1, free_nats_per_step=3.0, world=None,
+                     kl_min_nats=1.5, task_weights=None):
         """
         학습 loss: PAVING MTL로 inner task 벡터 + aggregated total.
 

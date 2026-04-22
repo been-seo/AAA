@@ -72,12 +72,21 @@ class InnerTaskManager:
 
         return G.cpu().numpy(), norms.cpu().numpy()
 
-    def condition_number(self, gram):
-        """κ(G) = σ_max / σ_min of gram matrix"""
+    def condition_number(self, gram, ridge=1e-3):
+        """
+        κ(G) = σ_max / σ_min of (gram + ridge·I).
+
+        Ridge regularization: task 간 중복성(예: sin/cos/heading_circ
+        모두 방향 측정)으로 인한 near-zero eigenvalue를 방지.
+        순수 κ는 무한대에 가까워져도, 실제 수치 안정성에 영향은
+        ridge-regularized κ가 더 적절한 지표.
+        """
         try:
-            eigvals = np.linalg.eigvalsh(gram)
+            K = gram.shape[0]
+            regularized = gram + ridge * np.eye(K)
+            eigvals = np.linalg.eigvalsh(regularized)
             eigvals = np.clip(eigvals, 1e-12, None)
-            return eigvals.max() / eigvals.min()
+            return float(eigvals.max() / eigvals.min())
         except Exception:
             return 1e6
 

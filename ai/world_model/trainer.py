@@ -458,19 +458,26 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = KalmanLRScheduler(optimizer, lr_init=args.lr)
 
-    # ── PAVING MTL controller ──
-    from .paving import (
-        InnerTaskManager, GroupingManager, CertificateController,
-        DEFAULT_GROUPS,
-    )
-    task_names = TrajectoryPredictor.INNER_TASKS
-    model._paving_itm = InnerTaskManager(task_names)
-    model._paving_mgr = GroupingManager(task_names, DEFAULT_GROUPS)
-    model._paving_ctrl = CertificateController(
-        kappa_max=20.0, W_lr=3, W_alpha=3)
-    model._task_weights = None  # 초기 균등
-    print(f"[PAVING] K={len(task_names)} inner tasks, "
-          f"{len(DEFAULT_GROUPS)} initial groups", flush=True)
+    # ── PAVING MTL controller (현재 비활성화: 관찰만) ──
+    # Inner task 간 redundancy로 κ 매우 크고, weight rebalance가
+    # KL을 과도 regularization시켜 posterior collapse 유발.
+    # 수동 균형 가중치로 고정 학습 후, 안정화되면 재활성화.
+    #
+    # 수동 가중치: 위치 우선, KL은 free_nats 높여서 posterior 다양성 유지
+    from .trajectory_predictor import TrajectoryPredictor as _TP
+    task_names = _TP.INNER_TASKS
+    model._task_weights = {
+        'pos_lat':      3.0, 'pos_lon':    3.0,   # 위치 강조
+        'alt':          2.0, 'vrate':      1.0,
+        'gs':           1.5, 'ias':        0.5, 'mach':  0.5,  # 속도 (gs 우선)
+        'track_sin':    2.0, 'track_cos':  2.0,   # 방향
+        'heading_circ': 1.0,
+        'kl':           0.1,   # KL 약하게 (posterior 다양성 확보)
+    }
+    model._paving_ctrl = None  # 비활성화 → trainer에서 skip
+    model._paving_itm = None
+    model._paving_mgr = None
+    print(f"[WM] Using fixed task weights, PAVING controller DISABLED", flush=True)
 
     # Resume
     start_epoch = 1
