@@ -125,13 +125,20 @@ class TrajectoryPredictor(nn.Module):
             nn.Linear(256, latent_dim * 2),
         )
 
-        # Delta decoder: (hidden, z) → Δstate (정규화 공간)
+        # Delta decoder: main branch (hidden, z) → Δstate
         self.delta_decoder = nn.Sequential(
             nn.Linear(hidden_dim + latent_dim, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
             nn.Linear(128, STATE_DIM),
+        )
+        # Z-residual branch: z가 delta에 직접 기여 (posterior collapse 방지)
+        # 이 branch가 없으면 decoder가 z를 무시하는 경향 (hidden만으로 예측).
+        self.z_residual = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, STATE_DIM),
         )
 
         # Normalization params
@@ -174,15 +181,15 @@ class TrajectoryPredictor(nn.Module):
     def _posterior(self, hidden, state_emb):
         params = self.posterior_net(torch.cat([hidden, state_emb], dim=-1))
         mean, log_std = params.chunk(2, dim=-1)
-        # log_std 하한 -1 (std ≥ 0.37): posterior collapse 방지.
-        # std가 너무 작아지면 z가 결정론적이 되어 MC 샘플 다양성 상실.
-        return mean, log_std.clamp(-1.0, 2.0)
+        # log_std 하한 -2.5 (std ≥ 0.08): cruise/approach 같은 tight
+        # 상황도 accurate prediction 가능하도록 충분히 낮게, 동시에
+        # 극단적 collapse(std < 0.01)는 방지.
+        return mean, log_std.clamp(-2.5, 2.0)
 
     def _prior(self, hidden):
         params = self.prior_net(hidden)
         mean, log_std = params.chunk(2, dim=-1)
-        # prior도 동일 하한 — 예측(MC sampling) 시 샘플 다양성 보장
-        return mean, log_std.clamp(-1.0, 2.0)
+        return mean, log_std.clamp(-2.5, 2.0)
 
     def _sample_z(self, mean, log_std):
         return mean + log_std.exp() * torch.randn_like(log_std)
@@ -190,8 +197,10 @@ class TrajectoryPredictor(nn.Module):
     # ── Delta decoder ──
 
     def _decode_delta(self, hidden, z):
-        """(hidden, z) → Δstate (정규화 공간, clamped)"""
+        """(hidden, z) → Δstate (정규화 공간, clamped).
+        Main branch + z-residual: z가 delta에 명시적으로 영향."""
         delta = self.delta_decoder(torch.cat([hidden, z], dim=-1))
+        delta = delta + self.z_residual(z)  # z-skip connection
         return delta.clamp(-self.delta_clamp, self.delta_clamp)
 
     # ── Forward (학습) ──
@@ -440,8 +449,8 @@ class TrajectoryPredictor(nn.Module):
     ]
 
     def compute_loss(self, past_states, future_states, contexts,
-                     kl_weight=0.1, free_nats_per_step=3.0, world=None,
-                     kl_min_nats=1.5, task_weights=None):
+                     kl_weight=0.1, free_nats_per_step=1.0, world=None,
+                     kl_min_nats=0.3, task_weights=None):
         """
         학습 loss: PAVING MTL로 inner task 벡터 + aggregated total.
 

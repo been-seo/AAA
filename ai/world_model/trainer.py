@@ -464,10 +464,10 @@ def main():
     from .trajectory_predictor import TrajectoryPredictor as _TP
     task_names = _TP.INNER_TASKS
     model._task_weights = {
-        'pos_lat':   3.0, 'pos_lon':   3.0,   # 위치
+        'pos_lat':   5.0, 'pos_lon':   5.0,   # 위치 (v5 수준으로 복원)
         'alt':       2.0, 'vrate':     1.0,   # 수직
-        'gs':        1.5, 'ias':       0.5, 'mach': 0.5,  # 속도 (gs 우선)
-        'track_sin': 2.0, 'track_cos': 2.0,   # 방향
+        'gs':        1.5, 'ias':       0.5, 'mach': 0.5,  # 속도
+        'track_sin': 3.0, 'track_cos': 3.0,   # 방향 (heading_circ 제거 보상)
     }
     model._paving_ctrl = None
     model._paving_itm = None
