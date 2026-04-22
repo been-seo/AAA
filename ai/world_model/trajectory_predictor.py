@@ -174,12 +174,15 @@ class TrajectoryPredictor(nn.Module):
     def _posterior(self, hidden, state_emb):
         params = self.posterior_net(torch.cat([hidden, state_emb], dim=-1))
         mean, log_std = params.chunk(2, dim=-1)
-        return mean, log_std.clamp(-5, 2)
+        # log_std 하한 -1 (std ≥ 0.37): posterior collapse 방지.
+        # std가 너무 작아지면 z가 결정론적이 되어 MC 샘플 다양성 상실.
+        return mean, log_std.clamp(-1.0, 2.0)
 
     def _prior(self, hidden):
         params = self.prior_net(hidden)
         mean, log_std = params.chunk(2, dim=-1)
-        return mean, log_std.clamp(-5, 2)
+        # prior도 동일 하한 — 예측(MC sampling) 시 샘플 다양성 보장
+        return mean, log_std.clamp(-1.0, 2.0)
 
     def _sample_z(self, mean, log_std):
         return mean + log_std.exp() * torch.randn_like(log_std)
