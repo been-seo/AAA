@@ -303,6 +303,20 @@ class TrajectoryPredictor(nn.Module):
 
         trajectories = []
 
+        # Inference-time state noise (정규화 공간).
+        # VAE posterior가 tight하게 수렴해도 실측 불확실성은 시간에 따라
+        # 증가하므로, per-step state noise를 명시적으로 주입.
+        # 실측 q90 ~ 9NM at 120s → 정규화 공간에서 lat std ≈ 9/60/3 ≈ 0.05
+        # 시간축 sqrt 비례 (random walk).
+        noise_std_base = torch.zeros(STATE_DIM, device=device)
+        # NORM_STD에 대한 per-step 상대 noise
+        noise_std_base[0] = 0.015  # lat: ~0.9 NM/step
+        noise_std_base[1] = 0.015  # lon
+        noise_std_base[2] = 0.01   # alt (norm_std 15000 → 150ft/step)
+        noise_std_base[3] = 0.01   # gs (norm_std 150 → 1.5kt/step)
+        noise_std_base[4] = 0.015  # track (norm_std 180 → 2.7°/step)
+        noise_std_base[5] = 0.005  # vrate
+
         for t in range(future_steps):
             state_emb = self._encode_state(current_state)
             interaction = self.neighbor_attn(state_emb, empty_ctx)
@@ -315,6 +329,12 @@ class TrajectoryPredictor(nn.Module):
 
             pred_delta = self._decode_delta(h_t, z_exp)
             current_state = current_state + pred_delta
+
+            # Inference-time noise (학습에는 영향 없음, predict에서만)
+            if num_samples > 1:
+                t_factor = math.sqrt(t + 1)  # random walk
+                noise = torch.randn_like(current_state) * noise_std_base * t_factor
+                current_state = current_state + noise
 
             trajectories.append(current_state)
 
