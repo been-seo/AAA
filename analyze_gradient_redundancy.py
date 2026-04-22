@@ -125,27 +125,29 @@ def analyze(model_path, data_dir='data/recordings', batch_size=256,
     heading_tasks = ['track_sin', 'track_cos', 'heading_circ']
     heading_idx = [task_names.index(t) for t in heading_tasks if t in task_names]
 
+    heading_sub = None
+    heading_eig = None
     if len(heading_idx) == 3:
         print("\n" + "=" * 72)
         print("HEADING TRIO ANALYSIS (track_sin, track_cos, heading_circ)")
         print("=" * 72)
-        sub = gram[np.ix_(heading_idx, heading_idx)]
+        heading_sub = gram[np.ix_(heading_idx, heading_idx)].copy()
         print(f"3×3 sub-Gram:")
         for i, name in enumerate(heading_tasks):
-            print(f"  {name:>14} {sub[i]}")
+            print(f"  {name:>14} {heading_sub[i]}")
 
-        eig = np.linalg.eigvalsh(sub)
-        print(f"\n  Eigenvalues: {eig}")
-        print(f"  min λ:       {eig.min():.4f}")
-        print(f"  max λ:       {eig.max():.4f}")
-        print(f"  κ (condition): {eig.max() / max(eig.min(), 1e-9):.2e}")
-        print(f"  rank(≥1e-3):   {(eig > 1e-3).sum()}/3")
+        heading_eig = np.linalg.eigvalsh(heading_sub)
+        print(f"\n  Eigenvalues: {heading_eig}")
+        print(f"  min λ:       {heading_eig.min():.4f}")
+        print(f"  max λ:       {heading_eig.max():.4f}")
+        print(f"  κ (condition): {heading_eig.max() / max(heading_eig.min(), 1e-9):.2e}")
+        print(f"  rank(≥1e-3):   {(heading_eig > 1e-3).sum()}/3")
 
         # Pairwise |cos|
         print(f"\n  Pairwise |cos|:")
         for i in range(3):
             for j in range(i + 1, 3):
-                c = abs(sub[i, j])
+                c = abs(heading_sub[i, j])
                 print(f"    |cos({heading_tasks[i]}, {heading_tasks[j]})| = {c:.3f}")
 
     # ═══════════════════════════════════════════
@@ -247,8 +249,8 @@ def analyze(model_path, data_dir='data/recordings', batch_size=256,
         ],
         'heading_trio': {
             'tasks': heading_tasks,
-            'sub_gram': sub.tolist() if len(heading_idx) == 3 else None,
-            'eigenvalues': eig.tolist() if len(heading_idx) == 3 else None,
+            'sub_gram': heading_sub.tolist() if heading_sub is not None else None,
+            'eigenvalues': heading_eig.tolist() if heading_eig is not None else None,
         } if len(heading_idx) == 3 else None,
         'top_correlated_pairs': [
             {'pair': list(p), 'abs_cos': float(c)} for p, c in pairs[:10]
