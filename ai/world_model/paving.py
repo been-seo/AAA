@@ -132,15 +132,23 @@ class GroupingManager:
                 return g
         return None
 
-    def compute_weights_proportional(self, task_losses):
+    def compute_weights_proportional(self, task_losses, w_min=0.05, w_max=5.0):
         """
         PAVING CTRL_w: proportional weighting w_k = K/(L_k · Σ L_j^-1)
         Preserves task-count balance (original objective proportions).
+        Clamp to [w_min, w_max] to prevent pathological scales from
+        dominating gradient budget.
         """
-        losses = {k: max(float(task_losses[k]), 1e-6) for k in self.task_names}
+        # Normalize losses to [mean=1] first to reduce scale disparity
+        raw = {k: max(float(task_losses[k]), 1e-6) for k in self.task_names}
+        mean_loss = sum(raw.values()) / max(len(raw), 1)
+        losses = {k: v / max(mean_loss, 1e-6) for k, v in raw.items()}
         inv_sum = sum(1.0 / v for v in losses.values())
         K = self.K
-        return {k: K / (losses[k] * inv_sum) for k in self.task_names}
+        weights = {k: K / (losses[k] * inv_sum) for k in self.task_names}
+        # Clamp
+        weights = {k: min(max(v, w_min), w_max) for k, v in weights.items()}
+        return weights
 
     def summary(self):
         inv = {v: k for k, tasks in self.groups.items() for v in tasks}

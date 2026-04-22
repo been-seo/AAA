@@ -451,22 +451,25 @@ class TrajectoryPredictor(nn.Module):
         tl['heading_circ'] = (diff_norm ** 2).mean()
 
         # ── KL with free bits ──
+        # Inner task loss는 raw로 유지 (PAVING 가중치 계산 정확도 위해)
         kl_per_step = output['kl_loss'].mean(dim=0)  # (K,)
         T = kl_per_step.shape[0]
         kl_with_min = torch.clamp(kl_per_step, min=kl_min_nats)
         kl_total = torch.clamp(kl_with_min.sum() - free_nats_per_step * T, min=0)
-        tl['kl'] = kl_total * kl_weight  # 스케일 맞춤
+        tl['kl'] = kl_total  # raw, 가중치는 task_weights로 제어
 
         # ── Weighted aggregation ──
+        # kl_weight는 kl task의 기본 weight로 적용 (raw 값은 task_losses에 유지)
         if task_weights is None:
             task_weights = {k: 1.0 for k in self.INNER_TASKS}
+            task_weights['kl'] = kl_weight  # KL 기본 스케일
 
         total_loss = sum(tl[k] * task_weights.get(k, 1.0)
                          for k in self.INNER_TASKS)
 
         return {
             'total_loss': total_loss,
-            'task_losses': tl,  # dict of K tensors (scalar each)
-            'recon_loss': total_loss - tl['kl'],
+            'task_losses': tl,
+            'recon_loss': total_loss - tl['kl'] * task_weights.get('kl', 1.0),
             'kl_loss': tl['kl'],
         }

@@ -134,13 +134,16 @@ def compute_reward_episode(own_state, traffic_states, action, device,
     N_t = traffic_states.shape[1]
 
     # ── 내 항공기 vs 각 트래픽 거리 계산: (B, N_traffic) ──
+    # 대칭적 거리 계산: pair-wise 평균 위도로 cos_lat 적용
     t_lat = traffic_states[:, :, 0]  # (B, N)
     t_lon = traffic_states[:, :, 1]
     t_alt = traffic_states[:, :, 2]
 
     dlat = (my_lat.unsqueeze(1) - t_lat) * 60.0           # (B, N)
-    cos_lat = torch.cos(torch.deg2rad(my_lat)).unsqueeze(1).clamp(min=0.01)
-    dlon = (my_lon.unsqueeze(1) - t_lon) * 60.0 * cos_lat  # (B, N)
+    # 대칭성 유지: 두 점의 평균 위도로 코사인 계산
+    lat_mean = (my_lat.unsqueeze(1) + t_lat) / 2.0
+    cos_lat_pair = torch.cos(torch.deg2rad(lat_mean)).clamp(min=0.01)
+    dlon = (my_lon.unsqueeze(1) - t_lon) * 60.0 * cos_lat_pair  # (B, N)
     h_dist = torch.sqrt(dlat**2 + dlon**2)                  # (B, N) NM
     v_dist = torch.abs(my_alt.unsqueeze(1) - t_alt)         # (B, N) ft
 
@@ -210,22 +213,25 @@ def compute_reward_episode(own_state, traffic_states, action, device,
     # ── 목적지 관련 inner tasks ──
     cur_dist = None
     if dest_lat is not None:
-        d_dlat = (my_lat - dest_lat) * 60.0
-        d_cos = torch.cos(torch.deg2rad(my_lat)).clamp(min=0.01)
-        d_dlon = (my_lon - dest_lon) * 60.0 * d_cos
-        cur_dist = torch.sqrt(d_dlat**2 + d_dlon**2)
+        # bearing용: dest - my (목적지 방향)
+        north_nm = (dest_lat - my_lat) * 60.0
+        # 대칭: 두 점 평균 위도로 코사인
+        cos_mean = torch.cos(
+            torch.deg2rad((my_lat + dest_lat) / 2.0)).clamp(min=0.01)
+        east_nm = (dest_lon - my_lon) * 60.0 * cos_mean
+        cur_dist = torch.sqrt(north_nm**2 + east_nm**2)
 
         # direct: heading이 목적지 방향과 얼마나 정렬됐는지
-        dest_bearing = torch.atan2(d_dlon, d_dlat) * 180 / 3.14159  # 대략적 방위
-        hdg_diff = ((my_gs * 0 + own_state[:, 4]) - dest_bearing + 180) % 360 - 180  # hdg vs bearing
-        alignment = torch.cos(hdg_diff * 3.14159 / 180)  # 1=정렬, -1=역방향
+        # bearing = atan2(east, north) (항공 convention: N=0, E=90, 시계방향)
+        dest_bearing = torch.rad2deg(torch.atan2(east_nm, north_nm))
+        hdg_diff = (own_state[:, 4] - dest_bearing + 180) % 360 - 180
+        alignment = torch.cos(torch.deg2rad(hdg_diff))  # 1=정렬, -1=역방향
         r_direct += alignment * 2.0  # 정렬 보너스
 
-        # progress: 거리 변화
+        # progress: 거리 변화 (mission 전용, fuel과 분리)
         if prev_dist is not None:
             progress = (prev_dist - cur_dist).clamp(-5, 5)
             r_progress += progress * 3.0
-            r_fuel += progress * 1.0  # 가까워지면 연료비 정당화
 
         # alt_match: 목적지 고도 매칭
         if is_arrival is not None and dest_alt is not None:
@@ -233,25 +239,19 @@ def compute_reward_episode(own_state, traffic_states, action, device,
                 torch.tensor(10000.0, device=device),
                 dest_alt if dest_alt is not None else torch.tensor(20000.0, device=device))
             alt_err = torch.abs(my_alt - target_alt) / 1000.0  # kft 단위
-            # 가까울수록 보상 (30NM 이내일 때만)
             if cur_dist is not None:
                 near_dest = cur_dist < 50.0
                 r_alt_match -= near_dest.float() * alt_err.clamp(0, 10) * 2.0
 
-        # 터미널 평가
+        # 터미널 평가 (inner task 직교성 유지: 각 축은 해당 축 feature만)
         if is_terminal is not None and is_arrival is not None:
             arr_reached = is_arrival & (cur_dist < _APP_HANDOFF_DIST_NM) & \
                           (my_alt >= _APP_HANDOFF_ALT_MIN) & (my_alt <= _APP_HANDOFF_ALT_MAX)
             dep_reached = ~is_arrival & (cur_dist < 10.0)
             reached = arr_reached | dep_reached
 
-            fuel_frac = fuel_remaining.clamp(0, 1) if fuel_remaining is not None else torch.ones(B, device=device)
-
-            # 도달: progress + fuel 보너스
+            # progress: 목적지 도달 자체만 (fuel 정보 없음)
             r_progress += (reached & is_terminal).float() * 100.0
-            r_fuel += (reached & is_terminal).float() * fuel_frac * 50.0
-
-            # 미도달: progress 패널티
             not_reached_terminal = ~reached & is_terminal
             if init_dist is not None:
                 dist_frac = (cur_dist / init_dist.clamp(min=1.0)).clamp(0, 2)
@@ -259,7 +259,11 @@ def compute_reward_episode(own_state, traffic_states, action, device,
                 dist_frac = torch.ones(B, device=device)
             r_progress -= not_reached_terminal.float() * dist_frac * 50.0
 
+            # fuel: 연료 상태만 (거리 정보 없음)
             if fuel_remaining is not None:
+                fuel_frac = fuel_remaining.clamp(0, 1)
+                # 연료 효율 보너스: 잔량 비례 (도달 여부와 무관)
+                r_fuel += (is_terminal.float()) * fuel_frac * 30.0
                 fuel_empty = (fuel_remaining <= 0) & is_terminal
                 r_fuel -= fuel_empty.float() * 80.0
 
@@ -441,34 +445,44 @@ class Critic(nn.Module):
             'mission': self.mission(own_state, traffic_states, world_feat=world_feat),
         }
 
+    def set_value_range(self, axis, v_safe, v_crash):
+        """학습 종료 후 실측 V 분포를 기반으로 정규화 범위 설정."""
+        if not hasattr(self, '_v_range'):
+            self._v_range = {}
+        self._v_range[axis] = (float(v_safe), float(v_crash))
+
+    def _get_v_range(self, axis, default_safe=-25.0, default_crash=-100.0):
+        if hasattr(self, '_v_range') and axis in self._v_range:
+            return self._v_range[axis]
+        return default_safe, default_crash
+
     def risk_score(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: safety V → 위험도 [0,1].
-        선형 정규화: V_safe(-30) → 0%, V_crash(-100) → 100%
-        학습된 Critic의 실제 V 범위 기반.
+        선형 정규화: V_safe → 0%, V_crash → 100%.
+        set_value_range('safety', ...)로 실측 분포 기반 범위 설정 가능.
+        없으면 기본값 (-25, -100) 사용.
         """
-        # V 범위 (학습 결과 기반, 주기적 업데이트 필요)
-        V_SAFE = -25.0   # safe episode의 평균 V
-        V_CRASH = -100.0  # crash episode의 평균 V
-
+        v_safe, v_crash = self._get_v_range('safety')
         with torch.no_grad():
             v = self.safety(own_state, traffic_states, world_feat=world_feat)
-            # 선형 매핑: V_SAFE→0, V_CRASH→1
-            risk = (v - V_SAFE) / (V_CRASH - V_SAFE)
+            risk = (v - v_safe) / (v_crash - v_safe + 1e-6)
             return risk.clamp(0, 1)
 
     def axis_scores(self, own_state, traffic_states, world_feat=None):
-        """Safety Advisor용: 3축 점수 dict"""
-        V_SAFE = -25.0
-        V_CRASH = -100.0
-
+        """Safety Advisor용: 3축 위험도 dict.
+        각 축마다 독립적인 V 범위 사용 (축별 스케일 다름).
+        위험도 = (V_safe로부터 얼마나 멀리 V_crash 방향으로 이동했는가).
+        """
         with torch.no_grad():
-            vals = self.forward_all(own_state, traffic_states, world_feat=world_feat)
-            safety_risk = ((vals['safety'] - V_SAFE) / (V_CRASH - V_SAFE)).clamp(0, 1)
-            return {
-                'safety': safety_risk,
-                'efficiency': torch.sigmoid(-vals['efficiency'] * 0.1).clamp(0, 1),
-                'mission': torch.sigmoid(-vals['mission'] * 0.1).clamp(0, 1),
-            }
+            vals = self.forward_all(
+                own_state, traffic_states, world_feat=world_feat)
+            result = {}
+            for axis in ('safety', 'efficiency', 'mission'):
+                v_safe, v_crash = self._get_v_range(
+                    axis, default_safe=-10.0, default_crash=-50.0)
+                risk = (vals[axis] - v_safe) / (v_crash - v_safe + 1e-6)
+                result[axis] = risk.clamp(0, 1)
+            return result
 
 
 # ── 돌발 이벤트 주입 (배치 벡터화) ──
@@ -699,12 +713,16 @@ class DreamerTrainer:
             for step in range(self.horizon):
                 dt = (step + 1) * 10.0  # 초
                 moved = static_traffic.clone()
-                spd_nm_s = moved[:, :, 3] * 0.000514444 * 1.852 / 1000  # kt → NM/s 근사
+                # kt → NM/s: 1kt = 1NM/h = 1/3600 NM/s
+                spd_nm_s = moved[:, :, 3] / 3600.0
                 hdg_rad = torch.deg2rad(moved[:, :, 4])
+                # bearing convention: N=0°, E=90°
+                # lat += dist * cos(brg) / 60 (북쪽 성분)
+                # lon += dist * sin(brg) / (60 * cos_lat) (동쪽 성분)
                 moved[:, :, 0] += spd_nm_s * dt * torch.cos(hdg_rad) / 60.0
                 c_lat = torch.cos(torch.deg2rad(moved[:, :, 0])).clamp(min=0.01)
                 moved[:, :, 1] += spd_nm_s * dt * torch.sin(hdg_rad) / (60.0 * c_lat)
-                moved[:, :, 2] += moved[:, :, 5] / 60.0 * dt  # vrate
+                moved[:, :, 2] += moved[:, :, 5] / 60.0 * dt  # vrate (fpm → ft/s)
                 traffic_env[:, step] = moved
 
         # ── 목적지 할당 ──
@@ -1002,6 +1020,10 @@ class DreamerTrainer:
         v_crash = v_safety_all[crash_mask].mean().item() if crashes > 0 else 0.0
         v_safe = v_safety_all[~crash_mask].mean().item() if crashes < B else 0.0
 
+        # V 통계 EMA 업데이트 (risk_score 정규화용)
+        if crashes > 0 and crashes < B:
+            self.update_v_stats(v_safe, v_crash, alpha=0.01)
+
         # 축별 보상 합계
         r_sums = {ax: rollout['rewards'][ax].sum(dim=1).mean().item() for ax in REWARD_AXES}
 
@@ -1031,6 +1053,8 @@ class DreamerTrainer:
         }
 
     def save(self, path):
+        # Critic V 통계 EMA (risk_score 정규화용)
+        v_stats = getattr(self, '_v_stats_ema', {})
         torch.save({
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
@@ -1040,19 +1064,18 @@ class DreamerTrainer:
             'total_episodes': self.total_episodes,
             'total_crashes': self.total_crashes,
             'total_safe': self.total_safe,
+            'v_stats_ema': v_stats,  # {axis: {'safe': v, 'crash': v}}
         }, path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if 'actor' in ckpt:
-            # Actor 로드 (구조 변경 시 스킵)
             try:
                 self.actor.load_state_dict(ckpt['actor'])
                 self.actor_opt.load_state_dict(ckpt['actor_opt'])
                 print(f"[Dreamer] Loaded actor from checkpoint")
             except RuntimeError as e:
                 print(f"[Dreamer] Actor structure changed, starting fresh: {e}")
-            # Critic 로드 (구조 유지)
             try:
                 self.critic.load_state_dict(ckpt['critic'])
                 self.target_critic.load_state_dict(ckpt['target_critic'])
@@ -1067,3 +1090,32 @@ class DreamerTrainer:
         self.total_episodes = ckpt.get('total_episodes', 0)
         self.total_crashes = ckpt.get('total_crashes', 0)
         self.total_safe = ckpt.get('total_safe', 0)
+
+        # V 통계 복원 → critic에 범위 설정
+        v_stats = ckpt.get('v_stats_ema', {})
+        if v_stats:
+            for axis, stats in v_stats.items():
+                if 'safe' in stats and 'crash' in stats:
+                    self.critic.set_value_range(
+                        axis, stats['safe'], stats['crash'])
+            self._v_stats_ema = v_stats
+            print(f"[Dreamer] V stats loaded: {v_stats}")
+
+    def update_v_stats(self, v_safety_mean_safe, v_safety_mean_crash,
+                        alpha=0.01):
+        """학습 중 V 분포 EMA 업데이트 (save 시 ckpt에 기록)."""
+        if not hasattr(self, '_v_stats_ema'):
+            self._v_stats_ema = {}
+        for axis, (v_s, v_c) in [('safety', (v_safety_mean_safe, v_safety_mean_crash))]:
+            if axis not in self._v_stats_ema:
+                self._v_stats_ema[axis] = {'safe': v_s, 'crash': v_c}
+            else:
+                prev = self._v_stats_ema[axis]
+                self._v_stats_ema[axis] = {
+                    'safe': (1 - alpha) * prev['safe'] + alpha * v_s,
+                    'crash': (1 - alpha) * prev['crash'] + alpha * v_c,
+                }
+            self.critic.set_value_range(
+                axis,
+                self._v_stats_ema[axis]['safe'],
+                self._v_stats_ema[axis]['crash'])

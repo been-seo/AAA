@@ -193,6 +193,40 @@ class SafetyAdvisor:
             log.warning(f"[SafetyAdvisor] Critic load failed: {e}")
             self._critic = None
 
+    def _compute_world_feat(self, all_states):
+        """
+        학습 분포와 일치하는 world_feat 생성 (nearest WPs features).
+        학습 시 dataset이 생성한 것과 동일한 포맷.
+
+        :param all_states: (N, STATE_DIM) raw states
+        :return: (N, WORLD_DIM) or None
+        """
+        try:
+            from ai.world_model.dataset import (
+                _get_nearest_waypoints_batch, WORLD_DIM,
+                _load_waypoints,
+            )
+            import os
+            if not hasattr(self, '_wp_data'):
+                # ats_routes_named.json 경로 탐색
+                base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                wp_data = _load_waypoints(os.path.join(base, 'data', 'recordings'))
+                if wp_data is None:
+                    wp_data = _load_waypoints(base)
+                self._wp_data = wp_data
+            if self._wp_data is None:
+                return None
+
+            wp_arr, wp_types, _ = self._wp_data
+            lats = all_states[:, 0].cpu().numpy()
+            lons = all_states[:, 1].cpu().numpy()
+            tracks = all_states[:, 4].cpu().numpy()
+            feat = _get_nearest_waypoints_batch(
+                lats, lons, tracks, wp_arr, wp_types)
+            return torch.from_numpy(feat).to(all_states.device)
+        except Exception:
+            return None
+
     def _check_ai_risk(self, user_aircraft, all_aircraft):
         """
         user_aircraft에 대해 세부 요인별 위험도를 평가하고 경고를 생성한다.
@@ -232,10 +266,15 @@ class SafetyAdvisor:
         lat = all_states[:, 0]
         lon = all_states[:, 1]
         dlat = (lat.unsqueeze(1) - lat.unsqueeze(0)) * 60.0
-        cos_lat = torch.cos(torch.deg2rad(lat)).unsqueeze(1).clamp(min=0.01)
-        dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat
+        # Symmetric cos_lat: pair-wise mean of latitudes (대칭성 유지)
+        lat_mean = (lat.unsqueeze(1) + lat.unsqueeze(0)) / 2.0
+        cos_lat_pair = torch.cos(torch.deg2rad(lat_mean)).clamp(min=0.01)
+        dlon = (lon.unsqueeze(1) - lon.unsqueeze(0)) * 60.0 * cos_lat_pair
         dists_nm = torch.sqrt(dlat**2 + dlon**2)
         dists_nm.fill_diagonal_(1e9)
+
+        # world_feat: 가장 가까운 waypoints (학습 분포와 일치)
+        world_feat_batch = self._compute_world_feat(all_states)  # (N, WORLD_DIM)
 
         for ui, uac in enumerate(user_aircraft):
             traffic_norm = torch.zeros(1, 5, STATE_DIM, device=device)
@@ -246,9 +285,13 @@ class SafetyAdvisor:
                     traffic_norm[0, j] = all_norm[indices[j]]
 
             own_norm = all_norm[ui].unsqueeze(0)
+            world_feat = world_feat_batch[ui].unsqueeze(0) \
+                if world_feat_batch is not None else None
             with torch.no_grad():
-                overall_risk = self._critic.risk_score(own_norm, traffic_norm).item()
-                axis = self._critic.axis_scores(own_norm, traffic_norm)
+                overall_risk = self._critic.risk_score(
+                    own_norm, traffic_norm, world_feat=world_feat).item()
+                axis = self._critic.axis_scores(
+                    own_norm, traffic_norm, world_feat=world_feat)
                 ai_safety = axis['safety'].item()
                 ai_efficiency = axis['efficiency'].item()
                 ai_mission = axis['mission'].item()
@@ -295,9 +338,13 @@ class SafetyAdvisor:
                 nearest_ac = ac_list[nearest_idx]
                 nearest_dist = dists_nm[ui, nearest_idx].item()
                 if nearest_dist < 30:
-                    bearing_to = math.degrees(math.atan2(
-                        nearest_ac.lon - uac.lon,
-                        nearest_ac.lat - uac.lat)) % 360
+                    # 대칭 cos(lat) 보정 (평균 위도 기준)
+                    lat_mean_deg = (uac.lat + nearest_ac.lat) / 2.0
+                    cos_lat_m = max(math.cos(math.radians(lat_mean_deg)), 0.01)
+                    north = nearest_ac.lat - uac.lat
+                    east = (nearest_ac.lon - uac.lon) * cos_lat_m
+                    # bearing 항공 convention: N=0, E=90, 시계방향
+                    bearing_to = math.degrees(math.atan2(east, north)) % 360
                     approach_angle = abs((uac.track_true_deg - bearing_to + 180) % 360 - 180)
                     # heading이 상대방 쪽을 향할수록 위험
                     if approach_angle < 15:
