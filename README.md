@@ -9,7 +9,7 @@ AAA는 확률적 궤적 예측(World Model: GRU + VAE + Attention + Delta 예측
 ### 핵심 기능
 
 - **확률적 충돌 예측**: GRU 시퀀스 모델 + VAE 확률적 잠재 변수 + Attention 기반 항공기 상호작용. Delta 예측(변화량) 방식으로 물리적 유효성 보장. MC 샘플링으로 충돌 확률 정량화 (셔플 pairing)
-- **8 Inner Task 다목적 학습**: PAVING 프레임워크 기반 태스크 분해. 안전(수평분리/수직분리/고도), 효율(연료/경로), 임무(진행/고도매칭). φ-flow 단순 합산으로 학습, max|cos| 진단으로 직교성 실시간 모니터링
+- **7 Inner Task 다목적 학습**: PAVING 프레임워크 기반 태스크 분해. 안전(수평분리/수직분리/고도), 효율(연료/경로), 임무(진행/고도매칭). φ-flow 단순 합산으로 학습, max|cos| 진단으로 직교성 실시간 모니터링
 - **AI + 룰 이중 안전망**: World Model 기반 AI 탐지(주)와 closing rate 기반 룰 탐지(보조). 속도 기반 스캔 범위 자동 조정
 - **ACK 기반 경고 관리**: 경고 발행 → 통제사 확인(ACK) → 동일 이벤트 억제. 비상 경고(KADIZ 이탈, 스쿼크 7700/7600/7500)는 상황 해소 시에만 소멸
 - **Human-in-the-loop 데모**: 통제사가 직접 항공기를 생성·관제하며 AI 경고를 실시간 확인
@@ -23,7 +23,7 @@ AAA는 확률적 궤적 예측(World Model: GRU + VAE + Attention + Delta 예측
 Simulation Engine (항공기 물리 모델 + 공역 관리)
     │
     ├──▶ World Model (GRU+VAE+Attn, Delta 예측, MC 충돌 확률)
-    ├──▶ Dreamer MBPO (8 inner task, PAVING φ-flow)
+    ├──▶ Dreamer MBPO (7 inner task, PAVING φ-flow)
     │       Safety:  sep_h, sep_v, alt_floor
     │       Efficiency: fuel, direct
     │       Mission: progress, alt_match
@@ -42,7 +42,7 @@ Simulation Engine (항공기 물리 모델 + 공역 관리)
 녹화 데이터 → World Model 학습 (Delta 예측, 칼만 LR 스케줄링)
            → Dreamer MBPO:
              에피소드 = 실제 트래픽 속에서 내 항공기 1대 관제
-             8 inner task 보상 → φ = ΣL_k 합산 (PAVING CANON)
+             7 inner task 보상 → φ = ΣL_k 합산 (PAVING CANON)
              max|cos(∇L_k, ∇L_l)| 모니터링 (τ=0.5)
              certificate h monotonic 감소 확인
              Event Injector (돌발 상황 주입, ~10.5% 확률)
@@ -123,7 +123,7 @@ AAA/
 │       ├── physics.py               # 물리 모델 (reachable envelope)
 │       ├── dataset.py               # DB → 텐서 (증분 캐시)
 │       ├── trainer.py               # WM 학습 (칼만 LR)
-│       ├── dreamer_policy.py        # 8 inner task, PAVING φ-flow
+│       ├── dreamer_policy.py        # 7 inner task, PAVING φ-flow
 │       └── conflict_detector.py     # MC 충돌 확률 (셔플 pairing)
 │
 ├── gui/
@@ -157,16 +157,16 @@ AAA/
 | RATE | normal (12kfpm), quick (20kfpm) | 2개 |
 | HOLD | 현재 유지 | 1개 |
 
-### 8 Inner Tasks (PAVING)
+### 7 Inner Tasks (PAVING)
 
 | Group | Task | Feature | 보상 |
 |---|---|---|---|
 | Safety | sep_h | lat/lon 상대거리 | RA -100, TA -30 |
 | Safety | sep_v | alt 차이 | <500ft -50, <1000ft -20 |
 | Safety | alt_floor | 절대 고도 | <2000ft -60 |
-| Efficiency | fuel | 속도, 진행도 | -gs/600 + progress |
+| Efficiency | fuel | 속도, 잔량 | -gs/600, 종료시 잔량×30 |
 | Efficiency | direct | hdg vs 목적지 방위 | cos(err) × 2 |
-| Mission | progress | 거리 변화 | ±3/NM, 도달 +100 |
+| Mission | progress | 거리 변화, 도달 | ±3/NM, 도달 +100 |
 | Mission | alt_match | alt vs 목표 | 근접 시 -alt_err×2 |
 
 ### PAVING Framework

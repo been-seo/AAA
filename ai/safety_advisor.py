@@ -183,12 +183,19 @@ class SafetyAdvisor:
             critic.load_state_dict(ckpt['critic'])
             critic.eval()
 
+            # V 분포 통계 주입 (risk_score/axis_scores 정규화 범위)
+            v_stats = ckpt.get('v_stats_ema', {})
+            for axis, s in v_stats.items():
+                if isinstance(s, dict) and 'safe' in s and 'crash' in s:
+                    critic.set_value_range(axis, s['safe'], s['crash'])
+
             self._critic = critic
             self._critic_device = device
             self._critic_norm_mean = torch.from_numpy(NORM_MEAN).to(device)
             self._critic_norm_std = torch.from_numpy(NORM_STD).to(device)
             ep = ckpt.get('total_episodes', '?')
-            log.info(f"[SafetyAdvisor] Critic loaded ({ep} episodes)")
+            log.info(f"[SafetyAdvisor] Critic loaded ({ep} episodes), "
+                     f"V stats axes: {list(v_stats.keys())}")
         except Exception as e:
             log.warning(f"[SafetyAdvisor] Critic load failed: {e}")
             self._critic = None

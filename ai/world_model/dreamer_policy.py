@@ -445,22 +445,28 @@ class Critic(nn.Module):
             'mission': self.mission(own_state, traffic_states, world_feat=world_feat),
         }
 
+    # 축별 default V 범위 (실측 EMA 없을 때만 fallback).
+    # 학습 중 observed: safety ≈ (-25, -100), eff ≈ (-10, -30), mission ≈ (-10, -30)
+    _DEFAULT_V_RANGE = {
+        'safety':     (-25.0, -100.0),
+        'efficiency': (-10.0,  -30.0),
+        'mission':    (-10.0,  -30.0),
+    }
+
     def set_value_range(self, axis, v_safe, v_crash):
         """학습 종료 후 실측 V 분포를 기반으로 정규화 범위 설정."""
         if not hasattr(self, '_v_range'):
             self._v_range = {}
         self._v_range[axis] = (float(v_safe), float(v_crash))
 
-    def _get_v_range(self, axis, default_safe=-25.0, default_crash=-100.0):
+    def _get_v_range(self, axis):
         if hasattr(self, '_v_range') and axis in self._v_range:
             return self._v_range[axis]
-        return default_safe, default_crash
+        return self._DEFAULT_V_RANGE.get(axis, (-25.0, -100.0))
 
     def risk_score(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: safety V → 위험도 [0,1].
         선형 정규화: V_safe → 0%, V_crash → 100%.
-        set_value_range('safety', ...)로 실측 분포 기반 범위 설정 가능.
-        없으면 기본값 (-25, -100) 사용.
         """
         v_safe, v_crash = self._get_v_range('safety')
         with torch.no_grad():
@@ -469,17 +475,13 @@ class Critic(nn.Module):
             return risk.clamp(0, 1)
 
     def axis_scores(self, own_state, traffic_states, world_feat=None):
-        """Safety Advisor용: 3축 위험도 dict.
-        각 축마다 독립적인 V 범위 사용 (축별 스케일 다름).
-        위험도 = (V_safe로부터 얼마나 멀리 V_crash 방향으로 이동했는가).
-        """
+        """Safety Advisor용: 3축 위험도 dict (축별 V 범위 사용)."""
         with torch.no_grad():
             vals = self.forward_all(
                 own_state, traffic_states, world_feat=world_feat)
             result = {}
             for axis in ('safety', 'efficiency', 'mission'):
-                v_safe, v_crash = self._get_v_range(
-                    axis, default_safe=-10.0, default_crash=-50.0)
+                v_safe, v_crash = self._get_v_range(axis)
                 risk = (vals[axis] - v_safe) / (v_crash - v_safe + 1e-6)
                 result[axis] = risk.clamp(0, 1)
             return result
@@ -1015,14 +1017,20 @@ class DreamerTrainer:
 
         mean_v = {ax: rollout['values'][ax].mean().item() for ax in REWARD_AXES}
 
-        # Critic 판별력: crash/safe 에피소드별 V 분리
+        # Critic 판별력: crash/safe 에피소드별 V 분리 (3축 모두)
         v_safety_all = rollout['values']['safety'].mean(dim=1)  # (B,)
         v_crash = v_safety_all[crash_mask].mean().item() if crashes > 0 else 0.0
         v_safe = v_safety_all[~crash_mask].mean().item() if crashes < B else 0.0
 
-        # V 통계 EMA 업데이트 (risk_score 정규화용)
+        # V 통계 EMA 업데이트 (risk_score/axis_scores 정규화용)
         if crashes > 0 and crashes < B:
-            self.update_v_stats(v_safe, v_crash, alpha=0.01)
+            stats_by_axis = {}
+            for ax in REWARD_AXES:
+                v_all = rollout['values'][ax].mean(dim=1)  # (B,)
+                v_c = v_all[crash_mask].mean().item()
+                v_s = v_all[~crash_mask].mean().item()
+                stats_by_axis[ax] = (v_s, v_c)
+            self.update_v_stats(stats_by_axis, alpha=0.01)
 
         # 축별 보상 합계
         r_sums = {ax: rollout['rewards'][ax].sum(dim=1).mean().item() for ax in REWARD_AXES}
@@ -1101,19 +1109,23 @@ class DreamerTrainer:
             self._v_stats_ema = v_stats
             print(f"[Dreamer] V stats loaded: {v_stats}")
 
-    def update_v_stats(self, v_safety_mean_safe, v_safety_mean_crash,
-                        alpha=0.01):
-        """학습 중 V 분포 EMA 업데이트 (save 시 ckpt에 기록)."""
+    def update_v_stats(self, stats_by_axis, alpha=0.01):
+        """
+        학습 중 V 분포 EMA 업데이트 (save 시 ckpt에 기록).
+
+        :param stats_by_axis: dict[axis -> (v_safe, v_crash)]
+            예: {'safety': (-25, -100), 'efficiency': (-10, -40), ...}
+        """
         if not hasattr(self, '_v_stats_ema'):
             self._v_stats_ema = {}
-        for axis, (v_s, v_c) in [('safety', (v_safety_mean_safe, v_safety_mean_crash))]:
+        for axis, (v_s, v_c) in stats_by_axis.items():
             if axis not in self._v_stats_ema:
-                self._v_stats_ema[axis] = {'safe': v_s, 'crash': v_c}
+                self._v_stats_ema[axis] = {'safe': float(v_s), 'crash': float(v_c)}
             else:
                 prev = self._v_stats_ema[axis]
                 self._v_stats_ema[axis] = {
-                    'safe': (1 - alpha) * prev['safe'] + alpha * v_s,
-                    'crash': (1 - alpha) * prev['crash'] + alpha * v_c,
+                    'safe': (1 - alpha) * prev['safe'] + alpha * float(v_s),
+                    'crash': (1 - alpha) * prev['crash'] + alpha * float(v_c),
                 }
             self.critic.set_value_range(
                 axis,
