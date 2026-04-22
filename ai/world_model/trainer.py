@@ -443,10 +443,12 @@ def main():
     if dataset.has_world:
         data['world'] = dataset._cache_world
 
-    # 모델
-    model = TrajectoryPredictor(
+    # 모델 (Physics-based WM)
+    from .physics_wm import PhysicsWM
+    model = PhysicsWM(
         hidden_dim=args.hidden_dim,
-        latent_dim=args.latent_dim,
+        use_world=True,
+        past_steps=args.past_steps,
     ).to(device)
     param_count = sum(p.numel() for p in model.parameters())
 
@@ -458,22 +460,18 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = KalmanLRScheduler(optimizer, lr_init=args.lr)
 
-    # ── Inner task weights (K=9, redundancy 제거됨) ──
-    # heading_circ, kl 제거 (gradient_redundancy.json 근거)
-    # PAVING controller 비활성화: task가 직교에 가까우니 균등 가중으로 충분
-    from .trajectory_predictor import TrajectoryPredictor as _TP
-    task_names = _TP.INNER_TASKS
+    # ── Physics WM: rate prediction tasks (K=3) ──
+    task_names = model.INNER_TASKS  # ['rate_omega_z', 'rate_a_x', 'rate_a_z']
     model._task_weights = {
-        'pos_lat':   5.0, 'pos_lon':   5.0,   # 위치 (v5 수준으로 복원)
-        'alt':       2.0, 'vrate':     1.0,   # 수직
-        'gs':        1.5, 'ias':       0.5, 'mach': 0.5,  # 속도
-        'track_sin': 3.0, 'track_cos': 3.0,   # 방향 (heading_circ 제거 보상)
+        'rate_omega_z': 3.0,   # 방향 (선회) — 제일 중요
+        'rate_a_x':     1.5,   # 속도 변화
+        'rate_a_z':     1.0,   # 수직 가속
     }
     model._paving_ctrl = None
     model._paving_itm = None
     model._paving_mgr = None
-    print(f"[WM] K={len(task_names)} inner tasks, fixed weights, "
-          f"PAVING controller DISABLED", flush=True)
+    print(f"[WM] Physics WM: K={len(task_names)} rate tasks, "
+          f"forward_dynamics 적분, KL/VAE 없음", flush=True)
 
     # Resume
     start_epoch = 1
