@@ -280,7 +280,7 @@ class Aircraft:
         pygame.draw.polygon(surface, color, points)
         return surface
 
-    def draw(self, screen, map_obj, font):
+    def draw(self, screen, map_obj, font, label_placer=None):
         should_draw = True
         if self.is_blinking and (self._blink_timer % 1.0) < 0.5:
             should_draw = False
@@ -313,20 +313,13 @@ class Aircraft:
         rotated = pygame.transform.rotate(scaled, -draw_hdg)
         screen.blit(rotated, rotated.get_rect(center=(sx, sy)))
 
-        # 콜사인
-        label = render_text_with_simple_outline(font, self.callsign, color, outline)
-        ty = int(icon_sz * 1.5) + 5
-        screen.blit(label, label.get_rect(center=(sx, sy + ty)))
-
-        # 고도/속도/연료
-        iy = ty + int(font.get_height() * 0.7)
+        # 라벨 텍스트 준비
         if self.is_user_controlled:
             l1 = f"{int(self.alt_current)}ft"
             l2 = f"{int(self.spd_current)}kts"
             if self.instruction_pending or self.instruction_active:
                 l1 += f" ({int(self.alt_target)})"
                 l2 += f" ({int(self.spd_target)})"
-            # 연료 표시
             fuel_color = color
             if self.fuel_bingo:
                 fuel_color = RED
@@ -337,11 +330,32 @@ class Aircraft:
             l1 = f"{int(self.alt_current)}ft {self.vertical_rate_ft_min:+.0f}"
             l2 = f"{int(self.ground_speed_kt)}kts"
             l3 = None
-        lines = [l1, l2] + ([l3] if l3 else [])
-        line_colors = [color, color] + ([fuel_color] if l3 else [])
-        for i, (line, lc) in enumerate(zip(lines, line_colors)):
-            s = render_text_with_simple_outline(font, line, lc, outline)
-            screen.blit(s, s.get_rect(center=(sx, sy + iy + int(font.get_height() * 0.9 * i))))
+            fuel_color = color
+
+        all_lines = [self.callsign, l1, l2] + ([l3] if l3 else [])
+        all_colors = [color, color, color] + ([fuel_color] if l3 else [])
+        surfs = [render_text_with_simple_outline(font, t, c, outline)
+                 for t, c in zip(all_lines, all_colors)]
+        line_h = int(font.get_height() * 0.9)
+        block_w = max(s.get_width() for s in surfs)
+        block_h = line_h * len(surfs)
+
+        # 라벨 블록 기본 위치
+        ty = int(icon_sz * 1.5) + 5
+        base_x = sx - block_w // 2
+        base_y = sy + ty
+
+        if label_placer is not None:
+            bx, by, shifted = label_placer.find_pos(base_x, base_y, block_w, block_h)
+            if shifted:
+                pygame.draw.line(screen, color, (sx, sy),
+                                 (bx + block_w // 2, by), 1)
+        else:
+            bx, by = base_x, base_y
+
+        for i, s in enumerate(surfs):
+            screen.blit(s, s.get_rect(center=(bx + block_w // 2,
+                                               by + i * line_h + line_h // 2)))
 
     def contains_point(self, map_obj, px, py):
         sx, sy = map_obj.latlon_to_screen(self.lat, self.lon)

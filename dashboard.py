@@ -175,8 +175,8 @@ def api_data():
                COALESCE(v_crash, 0) as vcr,
                COALESCE(v_safe, 0) as vsf
         FROM dreamer_steps
-        WHERE step % {skip * 10} = 0
-        ORDER BY step
+        ORDER BY timestamp
+        LIMIT 2000
     ''').fetchall()
     db.close()
 
@@ -187,7 +187,7 @@ def api_data():
 
     for r in rows:
         step, mean_r, mean_v, crashes, ent, tot_ep, tot_cr, tot_safe, vs, ve, vm, rs, re, rm, vcr, vsf = r
-        steps.append(step)
+        steps.append(tot_ep)  # X축: episodes
         cr = (tot_cr / max(tot_ep, 1)) * 100
         crash_rate.append(round(cr, 2))
         v_safety.append(round(vs, 2))

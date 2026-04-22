@@ -323,6 +323,62 @@ class TrajectoryPredictor(nn.Module):
 
         return traj
 
+    def _calibrate_spread(self, traj, B, num_samples, future_steps):
+        """
+        MC 샘플 분산이 실측 오차 범위보다 좁으면 노이즈로 확장.
+
+        실측 120초 후 오차 분포: q10=1.7NM, q50=4.5NM, q90=9.4NM
+        시간축별 q90을 선형 보간하여 최소 spread 보장.
+        """
+        device = traj.device
+        # 시간축별 목표 90% 반경 (NM) — 선형 증가 가정
+        # step 1(10초) ~ step 12(120초): 0.8NM ~ 9.4NM
+        target_q90 = torch.linspace(0.8, 9.4, future_steps, device=device)
+
+        # 현재 MC spread 계산 (위치: lat, lon)
+        # traj: (B, S, T, D)
+        mc_center_lat = traj[:, :, :, 0].mean(dim=1)  # (B, T)
+        mc_center_lon = traj[:, :, :, 1].mean(dim=1)  # (B, T)
+
+        cos_lat = torch.cos(torch.deg2rad(mc_center_lat)).clamp(min=0.5)
+
+        # 각 샘플의 중심으로부터 거리 (NM)
+        dlat = (traj[:, :, :, 0] - mc_center_lat[:, None, :]) * 60.0  # (B, S, T)
+        dlon = (traj[:, :, :, 1] - mc_center_lon[:, None, :]) * 60.0 * cos_lat[:, None, :]
+        dist = torch.sqrt(dlat**2 + dlon**2 + 1e-8)  # (B, S, T)
+
+        # 현재 90th percentile spread
+        current_q90 = dist.quantile(0.9, dim=1)  # (B, T)
+
+        # 부족한 만큼 보정 노이즈 추가
+        for t in range(future_steps):
+            deficit = (target_q90[t] - current_q90[:, t]).clamp(min=0)  # (B,)
+            # deficit > 0인 항공기만 노이즈 추가
+            mask = deficit > 0  # (B,)
+            if not mask.any():
+                continue
+
+            # 노이즈 스케일: deficit / 1.65 (90%ile ≈ 1.65σ for Rayleigh)
+            sigma_nm = deficit[mask] / 1.65  # (B_masked,)
+
+            # lat/lon 노이즈 (degree 변환)
+            sigma_lat = sigma_nm / 60.0  # NM → degree
+            center_lat_masked = mc_center_lat[mask, t]
+            cos_lat_masked = torch.cos(
+                torch.deg2rad(center_lat_masked)).clamp(min=0.5)
+            sigma_lon = sigma_nm / (60.0 * cos_lat_masked)
+
+            # 각 MC 샘플에 노이즈 추가
+            noise_lat = torch.randn(
+                mask.sum(), num_samples, device=device) * sigma_lat[:, None]
+            noise_lon = torch.randn(
+                mask.sum(), num_samples, device=device) * sigma_lon[:, None]
+
+            traj[mask, :, t, 0] += noise_lat
+            traj[mask, :, t, 1] += noise_lon
+
+        return traj
+
     # ── Loss ──
 
     @staticmethod
@@ -332,36 +388,85 @@ class TrajectoryPredictor(nn.Module):
         kl = 0.5 * (var1 / var2 + (mean2 - mean1).pow(2) / var2 - 1 + 2 * (logstd2 - logstd1))
         return kl.sum(dim=-1)
 
+    # ── Inner task 이름 (PAVING K=11) ──
+    INNER_TASKS = [
+        'pos_lat', 'pos_lon',        # Position (2)
+        'alt', 'vrate',               # Vertical (2)
+        'gs', 'ias', 'mach',          # Speed (3)
+        'track_sin', 'track_cos',    # Heading circular (2)
+        'heading_circ',               # Direct heading loss
+        'kl',                         # Latent
+    ]
+
     def compute_loss(self, past_states, future_states, contexts,
-                     kl_weight=0.1, free_nats_per_step=1.0, world=None):
+                     kl_weight=0.1, free_nats_per_step=1.0, world=None,
+                     kl_min_nats=0.5, task_weights=None):
         """
-        학습 loss: delta MSE + KL.
-        past_raw/future_raw 불필요 — 전부 정규화 공간에서 처리.
+        학습 loss: PAVING MTL로 inner task 벡터 + aggregated total.
+
+        Inner tasks (K=11):
+          Position: pos_lat, pos_lon
+          Vertical: alt, vrate
+          Speed: gs, ias, mach
+          Heading: track_sin, track_cos, heading_circ
+          Latent: kl
+
+        :param task_weights: dict[task_name -> float], None이면 균등
+        :return: dict with 'total_loss', 'task_losses' (dict), 'aux' info
         """
         output = self.forward(past_states, future_states, contexts, world=world)
 
         pred = output['pred_deltas']       # (B, T-1, D)
         target = output['target_deltas']   # (B, T-1, D)
+        device = past_states.device
 
-        dim_weights = torch.ones(STATE_DIM, device=past_states.device)
-        dim_weights[0] = 3.0  # lat
-        dim_weights[1] = 3.0  # lon
-        dim_weights[2] = 2.0  # alt
-        dim_weights[3] = 1.5  # gs
-        dim_weights[4] = 1.5  # track
+        # ── Per-dim inner task losses ──
+        tl = {}
 
-        delta_err = (pred - target).pow(2) * dim_weights
-        recon_loss = delta_err.sum(dim=-1).mean()
+        # Position (lat/lon): each separate inner task
+        tl['pos_lat'] = (pred[:, :, 0] - target[:, :, 0]).pow(2).mean()
+        tl['pos_lon'] = (pred[:, :, 1] - target[:, :, 1]).pow(2).mean()
 
-        K = past_states.shape[1]
-        kl_per_step = output['kl_loss'].mean(dim=0)
+        # Vertical
+        tl['alt'] = (pred[:, :, 2] - target[:, :, 2]).pow(2).mean()
+        tl['vrate'] = (pred[:, :, 5] - target[:, :, 5]).pow(2).mean()
+
+        # Speed
+        tl['gs'] = (pred[:, :, 3] - target[:, :, 3]).pow(2).mean()
+        tl['ias'] = (pred[:, :, 6] - target[:, :, 6]).pow(2).mean()
+        tl['mach'] = (pred[:, :, 7] - target[:, :, 7]).pow(2).mean()
+
+        # Heading: sin/cos decomposition (circular-safe)
+        # track is normalized by 180, so approximate unnorm:
+        pred_track_deg = pred[:, :, 4] * 180.0
+        tgt_track_deg = target[:, :, 4] * 180.0
+        pred_track_rad = torch.deg2rad(pred_track_deg)
+        tgt_track_rad = torch.deg2rad(tgt_track_deg)
+        tl['track_sin'] = (torch.sin(pred_track_rad) - torch.sin(tgt_track_rad)).pow(2).mean()
+        tl['track_cos'] = (torch.cos(pred_track_rad) - torch.cos(tgt_track_rad)).pow(2).mean()
+
+        # Circular heading direct loss
+        diff_deg = (pred_track_deg - tgt_track_deg + 180.0) % 360.0 - 180.0
+        diff_norm = diff_deg / 180.0
+        tl['heading_circ'] = (diff_norm ** 2).mean()
+
+        # ── KL with free bits ──
+        kl_per_step = output['kl_loss'].mean(dim=0)  # (K,)
         T = kl_per_step.shape[0]
-        kl = torch.clamp(kl_per_step.sum() - free_nats_per_step * T, min=0)
+        kl_with_min = torch.clamp(kl_per_step, min=kl_min_nats)
+        kl_total = torch.clamp(kl_with_min.sum() - free_nats_per_step * T, min=0)
+        tl['kl'] = kl_total * kl_weight  # 스케일 맞춤
 
-        total_loss = recon_loss + kl_weight * kl
+        # ── Weighted aggregation ──
+        if task_weights is None:
+            task_weights = {k: 1.0 for k in self.INNER_TASKS}
+
+        total_loss = sum(tl[k] * task_weights.get(k, 1.0)
+                         for k in self.INNER_TASKS)
 
         return {
             'total_loss': total_loss,
-            'recon_loss': recon_loss,
-            'kl_loss': kl,
+            'task_losses': tl,  # dict of K tensors (scalar each)
+            'recon_loss': total_loss - tl['kl'],
+            'kl_loss': tl['kl'],
         }

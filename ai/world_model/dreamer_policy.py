@@ -326,7 +326,7 @@ class Actor(nn.Module):
             w = torch.zeros(B, 64, device=own_state.device)
         h = self.trunk(torch.cat([s, t, w], dim=-1))
         mean = self.mean_head(h)
-        log_std = self.logstd_head(h).clamp(-5, 0)  # std ∈ [0.007, 1.0]
+        log_std = self.logstd_head(h).clamp(-2, 0)  # std ∈ [0.135, 1.0]
         return mean, log_std
 
     def get_action(self, own_state, traffic_states, deterministic=False, world_feat=None):
@@ -443,21 +443,29 @@ class Critic(nn.Module):
 
     def risk_score(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: safety V → 위험도 [0,1].
-        sigmoid(-V * scale)로 변환. scale은 학습 완료 후 보정 필요.
-
-        NOTE: Actor 학습이 불충분하면 Critic의 V가 변별력 없음.
-              이 경우 룰 기반 요인(SEP/CONV/ALT/SPD)을 우선 사용할 것.
+        선형 정규화: V_safe(-30) → 0%, V_crash(-100) → 100%
+        학습된 Critic의 실제 V 범위 기반.
         """
+        # V 범위 (학습 결과 기반, 주기적 업데이트 필요)
+        V_SAFE = -25.0   # safe episode의 평균 V
+        V_CRASH = -100.0  # crash episode의 평균 V
+
         with torch.no_grad():
             v = self.safety(own_state, traffic_states, world_feat=world_feat)
-            return torch.sigmoid(-v * 0.01).clamp(0, 1)
+            # 선형 매핑: V_SAFE→0, V_CRASH→1
+            risk = (v - V_SAFE) / (V_CRASH - V_SAFE)
+            return risk.clamp(0, 1)
 
     def axis_scores(self, own_state, traffic_states, world_feat=None):
         """Safety Advisor용: 3축 점수 dict"""
+        V_SAFE = -25.0
+        V_CRASH = -100.0
+
         with torch.no_grad():
             vals = self.forward_all(own_state, traffic_states, world_feat=world_feat)
+            safety_risk = ((vals['safety'] - V_SAFE) / (V_CRASH - V_SAFE)).clamp(0, 1)
             return {
-                'safety': torch.sigmoid(-vals['safety'] * 0.01).clamp(0, 1),
+                'safety': safety_risk,
                 'efficiency': torch.sigmoid(-vals['efficiency'] * 0.1).clamp(0, 1),
                 'mission': torch.sigmoid(-vals['mission'] * 0.1).clamp(0, 1),
             }

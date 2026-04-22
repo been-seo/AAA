@@ -185,6 +185,13 @@ def train_epoch(model, data, train_idx, batch_size, optimizer, device,
     n_total = (len(idx) + batch_size - 1) // batch_size
     has_world = 'world' in data
 
+    # PAVING state (passed via trainer attributes)
+    paving_mgr = getattr(model, '_paving_mgr', None)
+    paving_itm = getattr(model, '_paving_itm', None)
+    paving_ctrl = getattr(model, '_paving_ctrl', None)
+    task_weights = getattr(model, '_task_weights', None)
+    paving_every = 50  # compute gram every N batches
+
     for b in range(n_total):
         bi = idx[b * batch_size : (b + 1) * batch_size]
         past = data['past'][bi].to(device, non_blocking=True)
@@ -193,7 +200,8 @@ def train_epoch(model, data, train_idx, batch_size, optimizer, device,
         world = data['world'][bi].to(device, non_blocking=True) if has_world else None
 
         losses = model.compute_loss(past, future, ctx,
-                                    kl_weight=kl_weight, world=world)
+                                    kl_weight=kl_weight, world=world,
+                                    task_weights=task_weights)
 
         optimizer.zero_grad()
         losses['total_loss'].backward()
@@ -204,6 +212,47 @@ def train_epoch(model, data, train_idx, batch_size, optimizer, device,
         total_recon += losses['recon_loss'].detach()
         total_kl += losses['kl_loss'].detach()
         n_batches += 1
+
+        # ── PAVING: periodic controller step ──
+        if paving_ctrl and paving_itm and n_batches % paving_every == 0:
+            # Compute fresh task losses (no aggregation)
+            losses_p = model.compute_loss(past, future, ctx,
+                                          kl_weight=kl_weight, world=world)
+            tl = losses_p['task_losses']
+            try:
+                gram, grad_norms = paving_itm.compute_gram(model, tl)
+                kappa = paving_itm.condition_number(gram)
+                tl_scalar = {k: float(v.item()) for k, v in tl.items()}
+                h = sum(v**2 for v in tl_scalar.values()) / len(tl_scalar)
+
+                current_lr = optimizer.param_groups[0]['lr']
+                decision = paving_ctrl.step(
+                    kappa=kappa, h=h, task_losses=tl_scalar,
+                    gram=gram, task_names=paving_itm.task_names,
+                    current_lr=current_lr, grouping_mgr=paving_mgr,
+                    verbose=True)
+
+                # Apply decision
+                if decision['action'] == 'lr_cut':
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = decision['new_lr']
+                    print(f"[PAVING] LR cut: {current_lr:.2e} → {decision['new_lr']:.2e}", flush=True)
+                elif decision['action'] == 'lr_recover':
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = decision['new_lr']
+                    print(f"[PAVING] LR recover: {decision['new_lr']:.2e}", flush=True)
+                elif decision['action'] == 'rebalance':
+                    model._task_weights = decision['new_weights']
+                    task_weights = model._task_weights
+                    print(f"[PAVING] Rebalanced weights: "
+                          f"{ {k:f'{v:.2f}' for k,v in decision['new_weights'].items()} }", flush=True)
+                elif decision['action'] == 'regroup':
+                    pair = decision['merge_pair']
+                    ok = paving_mgr.merge(pair[0], pair[1])
+                    print(f"[PAVING] Regroup {pair}, cos={decision['merge_cos']:.2f}, "
+                          f"merged={ok}, groups={paving_mgr.summary()['n_groups']}", flush=True)
+            except Exception as e:
+                print(f"[PAVING] Error: {e}", flush=True)
 
         if n_batches % 20 == 0:
             avg = total_loss.item() / n_batches
@@ -224,6 +273,7 @@ def validate(model, data, val_idx, batch_size, device, kl_weight=0.1):
     total_kl = torch.tensor(0.0, device=device)
     n_batches = 0
     position_errors = []
+    eval_metrics = {}  # coverage, sharpness 등
 
     n_total = (len(val_idx) + batch_size - 1) // batch_size
     has_world = 'world' in data
@@ -245,40 +295,98 @@ def validate(model, data, val_idx, batch_size, device, kl_weight=0.1):
         total_recon += losses['recon_loss']
         total_kl += losses['kl_loss']
 
-        # 위치 오차: predict로 궤적 생성 후 비교
+        # 위치 평가: MC 샘플 분포 기반 calibration + pos_err
         # GPU 메모리 절약: 소량 랜덤 샘플링 + zero 필터링
         if b == 0:
             valid_mask = future_raw.abs().sum(dim=(1, 2)) > 1e-6
             valid_past = past[valid_mask]
             valid_fr = future_raw[valid_mask]
             valid_ctx = ctx[valid_mask]
-            n_eval = min(64, valid_past.shape[0])
+            valid_world = None
+            if has_world:
+                w_batch = data['world'][bi].to(device, non_blocking=True)
+                valid_world = w_batch[valid_mask]
+            n_eval = min(128, valid_past.shape[0])
             if n_eval > 0:
-                rand_idx = torch.randperm(valid_past.shape[0])[:n_eval]
-                traj = model.predict(valid_past[rand_idx],
-                                     valid_ctx[rand_idx, :past.shape[1]],
-                                     num_samples=5,
-                                     future_steps=valid_fr.shape[1])
-                pred_mean = traj.mean(dim=1)  # (n, N, D) 비정규화됨
-                fr = valid_fr[rand_idx]
-                lat_err = (pred_mean[:, :, 0] - fr[:, :, 0]) * 60.0
-                lon_err = (pred_mean[:, :, 1] - fr[:, :, 1]) * 60.0 * \
-                          torch.cos(torch.deg2rad(fr[:, :, 0])).clamp(min=0.5)
+                rand_idx = torch.randperm(valid_past.shape[0], device=device)[:n_eval]
+                eval_past = valid_past[rand_idx]
+                eval_ctx = valid_ctx[rand_idx, :past.shape[1]]
+                eval_world = None
+                if valid_world is not None:
+                    eval_world = valid_world[rand_idx, :past.shape[1]]
+                traj = model.predict(eval_past, eval_ctx,
+                                     num_samples=20,
+                                     future_steps=valid_fr.shape[1],
+                                     world_past=eval_world)
+                # traj: (n, 20, T, D) 비정규화
+                fr = valid_fr[rand_idx]  # (n, T, D) — 이미 GPU
+
+                # 각 샘플의 위치 오차 (NM)
+                cos_lat = torch.cos(torch.deg2rad(fr[:, :, 0])).clamp(min=0.5)
+                # MC 샘플별 오차: (n, 20, T)
+                lat_err_mc = (traj[:, :, :, 0] - fr[:, None, :, 0]) * 60.0
+                lon_err_mc = (traj[:, :, :, 1] - fr[:, None, :, 1]) * 60.0 * cos_lat[:, None, :]
+                pos_err_mc = torch.sqrt(lat_err_mc**2 + lon_err_mc**2)  # (n, 20, T)
+
+                # 1) pos_err: MC 중앙값 기준
+                pred_median = traj.median(dim=1).values  # (n, T, D)
+                lat_err = (pred_median[:, :, 0] - fr[:, :, 0]) * 60.0
+                lon_err = (pred_median[:, :, 1] - fr[:, :, 1]) * 60.0 * cos_lat
                 pos_err = torch.sqrt(lat_err**2 + lon_err**2)
                 position_errors.append(pos_err.cpu().numpy())
+
+                # 시간축별 오차 분포 → 예측 범위 상하한
+                err_q10 = pos_err.quantile(0.1, dim=0)   # (T,) 하한 (최소 오차)
+                err_q50 = pos_err.quantile(0.5, dim=0)   # (T,) 중앙값
+                err_q90 = pos_err.quantile(0.9, dim=0)   # (T,) 상한 (최대 오차)
+                eval_metrics['err_bounds'] = {
+                    'q10': err_q10.cpu().tolist(),  # 하한
+                    'q50': err_q50.cpu().tolist(),  # 중앙
+                    'q90': err_q90.cpu().tolist(),  # 상한
+                }
+
+                # 2) Coverage: MC 분포 범위가 실제 위치를 포함하는 비율
+                # MC 샘플들의 위치 분포에서 90% 반경 계산
+                # 각 (항공기, 타임스텝)별 MC 샘플 중심 = median
+                mc_center_lat = traj[:, :, :, 0].median(dim=1).values  # (n, T)
+                mc_center_lon = traj[:, :, :, 1].median(dim=1).values  # (n, T)
+                # MC 샘플들의 중심으로부터 거리
+                mc_lat_d = (traj[:, :, :, 0] - mc_center_lat[:, None, :]) * 60.0
+                mc_lon_d = (traj[:, :, :, 1] - mc_center_lon[:, None, :]) * 60.0 * cos_lat[:, None, :]
+                mc_dist_from_center = torch.sqrt(mc_lat_d**2 + mc_lon_d**2)  # (n, 20, T)
+                # 90% 반경: MC 샘플의 90th percentile 거리
+                radius_90 = mc_dist_from_center.quantile(0.9, dim=1)  # (n, T)
+
+                # 실제 위치의 MC 중심으로부터 거리
+                actual_lat_d = (fr[:, :, 0] - mc_center_lat) * 60.0
+                actual_lon_d = (fr[:, :, 1] - mc_center_lon) * 60.0 * cos_lat
+                actual_dist = torch.sqrt(actual_lat_d**2 + actual_lon_d**2)  # (n, T)
+
+                # Coverage: 실제가 90% 반경 안에 있는 비율
+                coverage_90 = (actual_dist <= radius_90).float().mean()
+
+                # 3) Sharpness: 90% 반경 평균 (작을수록 좋음)
+                sharpness = radius_90.mean()
+
+                eval_metrics['coverage_90'] = coverage_90.item()
+                eval_metrics['sharpness_nm'] = sharpness.item()
 
         n_batches += 1
 
     pos_err_all = np.concatenate(position_errors, axis=0) if position_errors else np.array([[0]])
 
-    return {
+    result = {
         'loss': total_loss.item() / max(n_batches, 1),
         'recon': total_recon.item() / max(n_batches, 1),
         'kl': total_kl.item() / max(n_batches, 1),
         'pos_err_1step': float(pos_err_all[:, 0].mean()) if pos_err_all.shape[1] > 0 else 0,
         'pos_err_5step': float(pos_err_all[:, min(4, pos_err_all.shape[1]-1)].mean()),
         'pos_err_final': float(pos_err_all[:, -1].mean()),
+        'coverage_90': eval_metrics.get('coverage_90', 0),
+        'sharpness_nm': eval_metrics.get('sharpness_nm', 0),
+        'err_bounds': eval_metrics.get('err_bounds', None),
     }
+    return result
 
 
 def main():
@@ -307,6 +415,7 @@ def main():
         data_dir=args.data_dir,
         past_steps=args.past_steps,
         future_steps=args.future_steps,
+        stride=4,
         max_files=args.max_files,
     )
     if len(dataset) == 0:
@@ -348,6 +457,20 @@ def main():
     # Optimizer + Kalman LR
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = KalmanLRScheduler(optimizer, lr_init=args.lr)
+
+    # ── PAVING MTL controller ──
+    from .paving import (
+        InnerTaskManager, GroupingManager, CertificateController,
+        DEFAULT_GROUPS,
+    )
+    task_names = TrajectoryPredictor.INNER_TASKS
+    model._paving_itm = InnerTaskManager(task_names)
+    model._paving_mgr = GroupingManager(task_names, DEFAULT_GROUPS)
+    model._paving_ctrl = CertificateController(
+        kappa_max=20.0, W_lr=3, W_alpha=3)
+    model._task_weights = None  # 초기 균등
+    print(f"[PAVING] K={len(task_names)} inner tasks, "
+          f"{len(DEFAULT_GROUPS)} initial groups", flush=True)
 
     # Resume
     start_epoch = 1
@@ -397,8 +520,19 @@ def main():
 
         is_best = val_metrics['loss'] < best_val_loss
         db_log.log_epoch(epoch, train_metrics, val_metrics, lr, dt, is_best)
+        cov = val_metrics.get('coverage_90', 0)
+        shrp = val_metrics.get('sharpness_nm', 0)
+        bounds = val_metrics.get('err_bounds')
+        bounds_str = ""
+        if bounds:
+            # 최종 스텝(120초)의 상하한
+            q10_f = bounds['q10'][-1]
+            q50_f = bounds['q50'][-1]
+            q90_f = bounds['q90'][-1]
+            bounds_str = f"range=[{q10_f:.1f}/{q50_f:.1f}/{q90_f:.1f}]NM "
         print(f"[Epoch {epoch}/{args.epochs}] loss={train_metrics['loss']:.4f} "
               f"val={val_metrics['loss']:.4f} pos_err={val_metrics.get('pos_err_final',0):.2f}NM "
+              f"cov90={cov:.0%} shrp={shrp:.1f}NM {bounds_str}"
               f"lr={lr:.1e} dt={dt:.0f}s {'*BEST*' if is_best else ''}")
         sys.stdout.flush()
 

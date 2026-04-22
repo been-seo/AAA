@@ -60,7 +60,8 @@ class ConflictDetector:
                  future_steps=12,
                  horiz_sep_nm=5.0,
                  vert_sep_ft=1000.0,
-                 scan_radius_nm=80.0):
+                 scan_radius_nm=80.0,
+                 hybrid_predictor=None):
         """
         :param model: TrajectoryPredictor 인스턴스
         :param num_mc_samples: Monte Carlo 샘플 수
@@ -68,6 +69,7 @@ class ConflictDetector:
         :param horiz_sep_nm: 수평 분리 기준 (NM)
         :param vert_sep_ft: 수직 분리 기준 (ft)
         :param scan_radius_nm: 분석 대상 반경 (NM)
+        :param hybrid_predictor: HybridPredictor (있으면 neural WM 대신 사용)
         """
         self.model = model
         self.device = device
@@ -76,6 +78,7 @@ class ConflictDetector:
         self.horiz_sep = horiz_sep_nm
         self.vert_sep = vert_sep_ft
         self.scan_radius = scan_radius_nm
+        self.hybrid_predictor = hybrid_predictor
 
         self.norm_mean = NORM_MEAN
         self.norm_std = NORM_STD
@@ -83,8 +86,11 @@ class ConflictDetector:
         self._last_scan = 0
         self._cache = {}  # icao → recent states buffer
         self._callsign_map = {}  # icao → {callsign, moa}
+        self._adsb_info = {}  # icao → {category, aircraft_model}
+        self._last_contexts = {}  # icao → AircraftContext (디버그/표시용)
 
-    def update_state(self, icao, state_dict, callsign=None, moa=None):
+    def update_state(self, icao, state_dict, callsign=None, moa=None,
+                     adsb_info=None):
         """
         항공기 상태 업데이트 (실시간 ADS-B 피드에서 호출)
 
@@ -117,6 +123,10 @@ class ConflictDetector:
                 self._callsign_map[icao]['callsign'] = callsign
             if moa:
                 self._callsign_map[icao]['moa'] = moa
+
+        # ADS-B 메타 저장
+        if adsb_info:
+            self._adsb_info[icao] = adsb_info
 
         # 최근 20개만 유지 (약 200초)
         if len(self._cache[icao]) > 20:
@@ -174,8 +184,6 @@ class ConflictDetector:
         :param min_prob: 반환할 최소 conflict 확률
         :return: list of ConflictPrediction
         """
-        self.model.eval()
-
         # 충분한 히스토리가 있는 항공기만
         valid_icaos = [icao for icao, states in self._cache.items()
                        if len(states) >= past_steps]
@@ -183,41 +191,15 @@ class ConflictDetector:
         if len(valid_icaos) < 2:
             return []
 
-        # 각 항공기의 과거 시퀀스 + context 준비
-        past_seqs = {}
-        ctx_seqs = {}
+        # Hybrid predictor가 있으면 사용, 없으면 기존 neural WM
+        if self.hybrid_predictor:
+            trajs_np, icao_list = self._predict_hybrid(
+                valid_icaos, past_steps)
+        else:
+            trajs_np, icao_list = self._predict_neural(
+                valid_icaos, past_steps)
 
-        for icao in valid_icaos:
-            states = self._cache[icao][-past_steps:]
-            past_arr = np.stack(states)  # (K, STATE_DIM)
-
-            # 정규화
-            past_norm = (past_arr - self.norm_mean) / self.norm_std
-
-            # Context (각 타임스텝별)
-            ctxs = []
-            for i, s in enumerate(states):
-                ctx = self._build_context(icao, s, self._cache)
-                ctxs.append(ctx)
-            ctx_arr = np.stack(ctxs)  # (K, MAX_N, CTX_DIM)
-
-            past_seqs[icao] = torch.from_numpy(past_norm).to(self.device)
-            ctx_seqs[icao] = torch.from_numpy(ctx_arr).to(self.device)
-
-        # 배치로 예측
-        icao_list = list(past_seqs.keys())
         B = len(icao_list)
-        batch_past = torch.stack([past_seqs[ic] for ic in icao_list])  # (B, K, D)
-        batch_ctx = torch.stack([ctx_seqs[ic] for ic in icao_list])  # (B, K, MAX_N, CTX)
-
-        # Monte Carlo 궤적 예측: (B, MC, T, STATE_DIM) — 비정규화된 상태
-        pred_trajs = self.model.predict(
-            batch_past, batch_ctx,
-            num_samples=self.num_mc,
-            future_steps=self.future_steps)
-
-        # numpy로 변환
-        trajs_np = pred_trajs.cpu().numpy()  # (B, MC, T, D)
 
         # 군 관련 쌍만 conflict 계산 (민-민은 우리 관할 아님)
         predictions = []
@@ -265,6 +247,70 @@ class ConflictDetector:
         # 확률 높은 순 정렬
         predictions.sort(key=lambda p: -p.probability)
         return predictions
+
+    def _predict_hybrid(self, valid_icaos, past_steps):
+        """Hybrid predictor로 각 항공기별 ���적 예측"""
+        icao_list = list(valid_icaos)
+        all_trajs = []
+
+        for icao in icao_list:
+            states = self._cache[icao][-past_steps:]
+            current = states[-1]
+            state_dict = {
+                'lat': current[0], 'lon': current[1],
+                'baro_altitude_ft': current[2],
+                'ground_speed_kt': current[3],
+                'true_track_deg': current[4],
+                'vertical_rate_ft_min': current[5],
+            }
+            # 히스토리 (dict 형태)
+            history = [
+                {'lat': s[0], 'lon': s[1], 'alt': s[2],
+                 'gs': s[3], 'track': s[4], 'vrate': s[5]}
+                for s in states
+            ]
+            adsb = self._adsb_info.get(icao, {'icao': icao})
+
+            ctx, traj = self.hybrid_predictor.predict_single(
+                icao, state_dict, history=history, adsb_info=adsb,
+                num_samples=self.num_mc, future_steps=self.future_steps)
+
+            # context 캐싱 (디버그/표시용)
+            self._last_contexts[icao] = ctx
+            all_trajs.append(traj)  # (MC, T, D)
+
+        trajs_np = np.stack(all_trajs)  # (B, MC, T, D)
+        return trajs_np, icao_list
+
+    def _predict_neural(self, valid_icaos, past_steps):
+        """기존 neural WM으로 배치 예측 (fallback)"""
+        self.model.eval()
+        past_seqs = {}
+        ctx_seqs = {}
+
+        for icao in valid_icaos:
+            states = self._cache[icao][-past_steps:]
+            past_arr = np.stack(states)
+            past_norm = (past_arr - self.norm_mean) / self.norm_std
+            ctxs = []
+            for s in states:
+                ctx = self._build_context(icao, s, self._cache)
+                ctxs.append(ctx)
+            ctx_arr = np.stack(ctxs)
+            past_seqs[icao] = torch.from_numpy(past_norm).to(self.device)
+            ctx_seqs[icao] = torch.from_numpy(ctx_arr).to(self.device)
+
+        icao_list = list(past_seqs.keys())
+        B = len(icao_list)
+        batch_past = torch.stack([past_seqs[ic] for ic in icao_list])
+        batch_ctx = torch.stack([ctx_seqs[ic] for ic in icao_list])
+
+        pred_trajs = self.model.predict(
+            batch_past, batch_ctx,
+            num_samples=self.num_mc, future_steps=self.future_steps)
+
+        trajs_np = pred_trajs.cpu().numpy()
+        return trajs_np, icao_list
 
     def _analyze_pair(self, icao_a, icao_b, traj_a, traj_b, dt_sec):
         """

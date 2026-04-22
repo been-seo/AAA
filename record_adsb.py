@@ -55,11 +55,27 @@ def record(args):
     t0 = time.time()
     last_report = t0
 
+    from datetime import datetime
+
     while not stop_event.is_set():
         elapsed = time.time() - t0
         if elapsed >= duration_sec:
             print(f"[Record] Duration reached ({args.hours:.0f}h)")
             break
+
+        # 주간 필터: --daytime 옵션 시 07:00~21:00만 녹화
+        if args.daytime:
+            hour = datetime.now().hour
+            if hour < 7 or hour >= 21:
+                # 야간: fetcher 일시 정지
+                if not getattr(fetcher, '_paused', False):
+                    fetcher._paused = True
+                    print(f"[Record] Night pause ({hour:02d}:xx, resume at 07:00)")
+                stop_event.wait(timeout=60)
+                continue
+            elif getattr(fetcher, '_paused', False):
+                fetcher._paused = False
+                print(f"[Record] Day resumed ({hour:02d}:xx)")
 
         try:
             while True:
@@ -127,6 +143,8 @@ def main():
                         help="녹화 포맷 (기본: db)")
     parser.add_argument("--import-jsonl", nargs='+', metavar='FILE',
                         help="JSONL 파일을 SQLite DB로 변환")
+    parser.add_argument("--daytime", action='store_true',
+                        help="주간만 녹화 (07:00~21:00 KST)")
     args = parser.parse_args()
 
     if args.import_jsonl:

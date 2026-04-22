@@ -145,7 +145,19 @@ class SafetyAdvisor:
             model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
 
-            self._conflict_detector = ConflictDetector(model, device=str(device))
+            # Hybrid Predictor: 항로/공역 기반 물리 예측 + neural WM fallback
+            try:
+                from ai.world_model.hybrid_predictor import HybridPredictor
+                hybrid = HybridPredictor(
+                    neural_model=model, device=str(device))
+                log.info("[SafetyAdvisor] HybridPredictor initialized "
+                         "(route/transit/MOA + neural fallback)")
+            except Exception as he:
+                log.warning(f"[SafetyAdvisor] HybridPredictor failed: {he}")
+                hybrid = None
+
+            self._conflict_detector = ConflictDetector(
+                model, device=str(device), hybrid_predictor=hybrid)
             log.info(f"[SafetyAdvisor] World Model loaded from {model_path} "
                      f"(epoch {checkpoint.get('epoch', '?')})")
         except Exception as e:
@@ -1217,6 +1229,10 @@ class SafetyAdvisor:
                     'vertical_rate_ft_min': getattr(uac, 'vertical_rate_ft_min', 0),
                     'ias_kt': uac.spd_current,
                     'mach': uac.spd_current / 660.0,
+                }, adsb_info={
+                    'icao': uac.callsign,
+                    'aircraft_model': getattr(uac, 'aircraft_model', ''),
+                    'category': getattr(uac, 'category', 0),
                 })
 
             # AI 스캔 범위: 속도 × 5분, 최소 10NM
@@ -1241,6 +1257,11 @@ class SafetyAdvisor:
                     'vertical_rate_ft_min': ac.vertical_rate_ft_min,
                     'ias_kt': getattr(ac, 'ias_kt', 0),
                     'mach': getattr(ac, 'mach', 0),
+                }, moa=getattr(ac, 'moa_name', None),
+                   adsb_info={
+                    'icao': icao,
+                    'aircraft_model': getattr(ac, 'aircraft_model', ''),
+                    'category': getattr(ac, 'category', 0),
                 })
 
             # Conflict 예측 실행

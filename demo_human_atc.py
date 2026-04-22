@@ -49,7 +49,7 @@ from ai.world_model.dataset import STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS
 from utils import render_text_with_simple_outline
 
 # ── 설정 ──
-MODEL_PATH = "models/world_model_v3/best_model.pt"
+MODEL_PATH = "models/world_model/best_model.pt"
 DREAMER_PATH = "models/dreamer/best.pt"
 PREDICTION_INTERVAL = 3.0
 CONFLICT_SCAN_INTERVAL = 5.0
@@ -875,6 +875,74 @@ def main():
                     mx, my = (int(ax) + int(bx)) // 2, (int(ay) + int(by)) // 2
                     s = render_text_with_simple_outline(sim.font, alert.title, line_color, BLACK)
                     sim.screen.blit(s, (mx - s.get_width() // 2, my - 10))
+
+        # ── Conflict 항공기 예측 궤적 자동 표시 ──
+        # 모든 alert 중 aircraft_involved가 있는 것 사용 (카테고리 무관)
+        traj_alerts = [a for a in alerts if getattr(a, 'aircraft_involved', None) and len(a.aircraft_involved) >= 2]
+        if traj_alerts and not conflict_alerts:
+            print(f"[TRAJ-DBG] no CONFLICT but have alerts with involved: cat={[a.category for a in traj_alerts[:3]]}")
+        if traj_alerts:
+            conflict_icaos = set()
+            # all_tracked 역매핑 빌드 (callsign → key)
+            cs_to_key = {}
+            for k, v in all_tracked.items():
+                cs_to_key[k] = k  # icao key 자체
+                v_cs = getattr(v, 'callsign', '')
+                if v_cs:
+                    cs_to_key[v_cs] = k  # callsign → key
+            for uac in sim.user_aircraft:
+                cs_to_key[uac.callsign] = f'USER_{uac.callsign}'
+
+            for alert in traj_alerts:
+                for cs in alert.aircraft_involved[:2]:
+                    matched = cs_to_key.get(cs)
+                    if matched:
+                        conflict_icaos.add(matched)
+                    else:
+                        # partial match: cs가 key의 일부일 수 있음
+                        for k in cs_to_key:
+                            if cs in k or k in cs:
+                                conflict_icaos.add(cs_to_key[k])
+                                break
+
+            # 선택 항공기 제외 (아래서 별도 표시)
+            conflict_icaos.discard(selected_icao)
+
+            for c_icao in conflict_icaos:
+                ac = all_tracked.get(c_icao)
+                if not ac:
+                    continue
+                # WM MC 예측 시도, 실패 시 linear fallback
+                c_traj = None
+                if model:
+                    try:
+                        c_traj = predict_trajectories(
+                            model, ac_history, c_icao, device,
+                            future_steps=future_steps, num_mc=MC_SAMPLES_VIS)
+                    except Exception:
+                        pass
+                if c_traj is None:
+                    lin = linear_extrapolate(ac, steps=future_steps)
+                    c_traj = lin[np.newaxis, :, :]  # (1, T, 3)
+
+                # MC 샘플 범위 그리기 (빨간색)
+                mc, T, _ = c_traj.shape
+                for s_idx in range(mc):
+                    pts = []
+                    for t in range(T):
+                        lat, lon = c_traj[s_idx, t, 0], c_traj[s_idx, t, 1]
+                        sx, sy = sim.map.latlon_to_screen(lat, lon)
+                        pts.append((int(sx), int(sy)))
+                    if len(pts) > 1:
+                        pygame.draw.lines(sim.screen, (255, 80, 80), False, pts, 1)
+                # 중앙 궤적 굵게
+                median_traj = np.median(c_traj, axis=0)  # (T, 3)
+                med_pts = []
+                for t in range(T):
+                    sx, sy = sim.map.latlon_to_screen(median_traj[t, 0], median_traj[t, 1])
+                    med_pts.append((int(sx), int(sy)))
+                if len(med_pts) > 1:
+                    pygame.draw.lines(sim.screen, (255, 50, 50), False, med_pts, 3)
 
         # ── 선택 항공기 예측 궤적 ──
         if pred_trajs is not None and selected_icao in all_tracked:

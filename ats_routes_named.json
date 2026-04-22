@@ -1,0 +1,1806 @@
+{
+  "source": "AIP Republic of Korea, ENR 3.1, AIRAC AIP AMDT 13/25, Effective 1600UTC 21 JAN 2026",
+  "routes": {
+    "A582": [
+      {
+        "name": "ANYANG VORTAC",
+        "lat": 37.413611,
+        "lon": 126.928333,
+        "type": "VORTAC",
+        "code": "SEL"
+      },
+      {
+        "name": "POLEG",
+        "lat": 37.213611,
+        "lon": 126.993056,
+        "type": "FIX"
+      },
+      {
+        "name": "SONGTAN VORTAC",
+        "lat": 37.094444,
+        "lon": 127.031667,
+        "type": "VORTAC",
+        "code": "SOT"
+      },
+      {
+        "name": "OSPOT",
+        "lat": 36.838333,
+        "lon": 127.348611,
+        "type": "FIX"
+      },
+      {
+        "name": "VASLI",
+        "lat": 36.714444,
+        "lon": 127.500833,
+        "type": "FIX"
+      },
+      {
+        "name": "MAKDU",
+        "lat": 36.453333,
+        "lon": 127.819167,
+        "type": "FIX"
+      },
+      {
+        "name": "BITUX",
+        "lat": 36.279167,
+        "lon": 128.03,
+        "type": "FIX"
+      },
+      {
+        "name": "DALSEONG VORTAC",
+        "lat": 35.809722,
+        "lon": 128.590833,
+        "type": "VORTAC",
+        "code": "TGU"
+      },
+      {
+        "name": "KALOD",
+        "lat": 35.503333,
+        "lon": 128.773889,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      },
+      {
+        "name": "APELA",
+        "lat": 34.723056,
+        "lon": 129.233333,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "A586": [
+      {
+        "name": "TENAS",
+        "lat": 37.638889,
+        "lon": 131.574167,
+        "type": "FIX"
+      },
+      {
+        "name": "AGSUS",
+        "lat": 36.755833,
+        "lon": 130.678889,
+        "type": "FIX"
+      },
+      {
+        "name": "DABIK",
+        "lat": 36.295278,
+        "lon": 130.195278,
+        "type": "FIX"
+      },
+      {
+        "name": "BULGA",
+        "lat": 35.935833,
+        "lon": 129.823333,
+        "type": "FIX"
+      },
+      {
+        "name": "BEDOM",
+        "lat": 35.420278,
+        "lon": 129.298333,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      },
+      {
+        "name": "OMOTU",
+        "lat": 35.009167,
+        "lon": 128.839444,
+        "type": "FIX"
+      },
+      {
+        "name": "TOPAX",
+        "lat": 34.765278,
+        "lon": 128.497778,
+        "type": "FIX"
+      },
+      {
+        "name": "GOSBO",
+        "lat": 34.254722,
+        "lon": 127.792778,
+        "type": "FIX"
+      },
+      {
+        "name": "MAKET",
+        "lat": 33.914444,
+        "lon": 127.331389,
+        "type": "FIX"
+      },
+      {
+        "name": "ATINA",
+        "lat": 33.722222,
+        "lon": 127.073056,
+        "type": "FIX"
+      },
+      {
+        "name": "MANOL",
+        "lat": 33.608056,
+        "lon": 126.920556,
+        "type": "FIX"
+      },
+      {
+        "name": "JEJU VORTAC",
+        "lat": 33.384722,
+        "lon": 126.624167,
+        "type": "VORTAC",
+        "code": "CJU"
+      },
+      {
+        "name": "TOSAN",
+        "lat": 33.003333,
+        "lon": 126.771944,
+        "type": "FIX"
+      },
+      {
+        "name": "RUGMA",
+        "lat": 32.503333,
+        "lon": 126.964722,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "A593": [
+      {
+        "name": "ONIKU",
+        "lat": 32.195,
+        "lon": 126.654722,
+        "type": "FIR_BDRY"
+      },
+      {
+        "name": "NIRAT",
+        "lat": 32.065,
+        "lon": 126.058056,
+        "type": "FIX"
+      },
+      {
+        "name": "PONIK",
+        "lat": 32.005833,
+        "lon": 125.783056,
+        "type": "FIX"
+      },
+      {
+        "name": "SADLI",
+        "lat": 31.83,
+        "lon": 125.0,
+        "type": "FIX"
+      },
+      {
+        "name": "LAMEN",
+        "lat": 31.61,
+        "lon": 124.0,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "A595": [
+      {
+        "name": "JEJU VORTAC",
+        "lat": 33.384722,
+        "lon": 126.624167,
+        "type": "VORTAC",
+        "code": "CJU"
+      },
+      {
+        "name": "TAMNA",
+        "lat": 33.470833,
+        "lon": 127.331389,
+        "type": "FIX"
+      },
+      {
+        "name": "SAMDO",
+        "lat": 33.584167,
+        "lon": 128.315833,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "B332": [
+      {
+        "name": "KANSU",
+        "lat": 38.633333,
+        "lon": 132.475,
+        "type": "FIR_BDRY"
+      },
+      {
+        "name": "PALDU",
+        "lat": 37.970278,
+        "lon": 132.606944,
+        "type": "FIX"
+      },
+      {
+        "name": "SABET",
+        "lat": 37.641389,
+        "lon": 132.671944,
+        "type": "FIX"
+      },
+      {
+        "name": "IGRAS",
+        "lat": 37.312778,
+        "lon": 132.736389,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "B467": [
+      {
+        "name": "GANGWON VORTAC",
+        "lat": 37.700833,
+        "lon": 128.753889,
+        "type": "VORTAC",
+        "code": "KAE"
+      },
+      {
+        "name": "LESBU",
+        "lat": 37.687778,
+        "lon": 129.684444,
+        "type": "FIX"
+      },
+      {
+        "name": "UGOVI",
+        "lat": 37.684722,
+        "lon": 129.8475,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSKO",
+        "lat": 37.675833,
+        "lon": 130.269444,
+        "type": "FIX"
+      },
+      {
+        "name": "TENAS",
+        "lat": 37.638889,
+        "lon": 131.574167,
+        "type": "FIX"
+      },
+      {
+        "name": "MALSO",
+        "lat": 37.911111,
+        "lon": 131.817778,
+        "type": "FIX"
+      },
+      {
+        "name": "KANSU",
+        "lat": 38.633333,
+        "lon": 132.475,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "B576": [
+      {
+        "name": "ANYANG VORTAC",
+        "lat": 37.413611,
+        "lon": 126.928333,
+        "type": "VORTAC",
+        "code": "SEL"
+      },
+      {
+        "name": "POLEG",
+        "lat": 37.213611,
+        "lon": 126.993056,
+        "type": "FIX"
+      },
+      {
+        "name": "SONGTAN VORTAC",
+        "lat": 37.094444,
+        "lon": 127.031667,
+        "type": "VORTAC",
+        "code": "SOT"
+      },
+      {
+        "name": "OLMEN",
+        "lat": 36.736944,
+        "lon": 126.991111,
+        "type": "FIX"
+      },
+      {
+        "name": "ENTEL",
+        "lat": 36.386389,
+        "lon": 126.951389,
+        "type": "FIX"
+      },
+      {
+        "name": "RINBO",
+        "lat": 35.897778,
+        "lon": 126.896944,
+        "type": "FIX"
+      },
+      {
+        "name": "LINTA",
+        "lat": 35.521111,
+        "lon": 126.855278,
+        "type": "FIX"
+      },
+      {
+        "name": "GWANGJU VOR",
+        "lat": 35.126111,
+        "lon": 126.812222,
+        "type": "VOR",
+        "code": "KWA"
+      },
+      {
+        "name": "IPDAS",
+        "lat": 34.254167,
+        "lon": 126.716944,
+        "type": "FIX"
+      },
+      {
+        "name": "JEJU VORTAC",
+        "lat": 33.384722,
+        "lon": 126.624167,
+        "type": "VORTAC",
+        "code": "CJU"
+      },
+      {
+        "name": "SOSDO",
+        "lat": 33.003333,
+        "lon": 126.459722,
+        "type": "FIX"
+      },
+      {
+        "name": "SAMLO",
+        "lat": 32.539722,
+        "lon": 126.26,
+        "type": "FIX"
+      },
+      {
+        "name": "NIRAT",
+        "lat": 32.065,
+        "lon": 126.058056,
+        "type": "FIX"
+      },
+      {
+        "name": "ELGEP",
+        "lat": 31.781389,
+        "lon": 125.938056,
+        "type": "FIX"
+      },
+      {
+        "name": "TESIM",
+        "lat": 31.590556,
+        "lon": 125.857778,
+        "type": "FIX"
+      },
+      {
+        "name": "ATOTI",
+        "lat": 30.003611,
+        "lon": 125.198333,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "G339": [
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      },
+      {
+        "name": "INVOK",
+        "lat": 34.788611,
+        "lon": 129.323056,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "G585": [
+      {
+        "name": "ANYANG VORTAC",
+        "lat": 37.413611,
+        "lon": 126.928333,
+        "type": "VORTAC",
+        "code": "SEL"
+      },
+      {
+        "name": "KALMA",
+        "lat": 37.3125,
+        "lon": 127.1125,
+        "type": "FIX"
+      },
+      {
+        "name": "KAKSO",
+        "lat": 37.129167,
+        "lon": 127.443611,
+        "type": "FIX"
+      },
+      {
+        "name": "GUKDO",
+        "lat": 37.019722,
+        "lon": 127.639722,
+        "type": "FIX"
+      },
+      {
+        "name": "ENSAL",
+        "lat": 36.931667,
+        "lon": 127.796389,
+        "type": "FIX"
+      },
+      {
+        "name": "BASEM",
+        "lat": 36.843611,
+        "lon": 127.952778,
+        "type": "FIX"
+      },
+      {
+        "name": "BIGOB",
+        "lat": 36.723611,
+        "lon": 128.164444,
+        "type": "FIX"
+      },
+      {
+        "name": "YECHEON VOR",
+        "lat": 36.631944,
+        "lon": 128.325278,
+        "type": "VOR",
+        "code": "CUN"
+      },
+      {
+        "name": "ELAPI",
+        "lat": 36.337222,
+        "lon": 128.8475,
+        "type": "FIX"
+      },
+      {
+        "name": "POHANG VORTAC",
+        "lat": 35.977222,
+        "lon": 129.474444,
+        "type": "VORTAC",
+        "code": "KPO"
+      },
+      {
+        "name": "BULGA",
+        "lat": 35.935833,
+        "lon": 129.823333,
+        "type": "FIX"
+      },
+      {
+        "name": "SAPRA",
+        "lat": 35.823889,
+        "lon": 130.723611,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "G597": [
+      {
+        "name": "AGAVO",
+        "lat": 37.166667,
+        "lon": 124.0,
+        "type": "FIR_BDRY"
+      },
+      {
+        "name": "GONAV",
+        "lat": 37.18,
+        "lon": 124.414722,
+        "type": "FIX"
+      },
+      {
+        "name": "DANTI",
+        "lat": 37.301667,
+        "lon": 124.658056,
+        "type": "FIX"
+      },
+      {
+        "name": "ANSIM",
+        "lat": 37.389722,
+        "lon": 124.835833,
+        "type": "FIX"
+      },
+      {
+        "name": "BINIL",
+        "lat": 37.396944,
+        "lon": 125.233056,
+        "type": "FIX"
+      },
+      {
+        "name": "NOPIK",
+        "lat": 37.403333,
+        "lon": 125.651389,
+        "type": "FIX"
+      },
+      {
+        "name": "GOGET",
+        "lat": 37.411667,
+        "lon": 126.51,
+        "type": "FIX"
+      },
+      {
+        "name": "ANYANG VORTAC",
+        "lat": 37.413611,
+        "lon": 126.928333,
+        "type": "VORTAC",
+        "code": "SEL"
+      },
+      {
+        "name": "EGOBA",
+        "lat": 37.4875,
+        "lon": 127.379444,
+        "type": "FIX"
+      },
+      {
+        "name": "KARBU",
+        "lat": 37.533056,
+        "lon": 127.664444,
+        "type": "FIX"
+      },
+      {
+        "name": "TORUS",
+        "lat": 37.606944,
+        "lon": 128.135278,
+        "type": "FIX"
+      },
+      {
+        "name": "BIKSI",
+        "lat": 37.675556,
+        "lon": 128.584444,
+        "type": "FIX"
+      },
+      {
+        "name": "GANGWON VORTAC",
+        "lat": 37.700833,
+        "lon": 128.753889,
+        "type": "VORTAC",
+        "code": "KAE"
+      },
+      {
+        "name": "PILIT",
+        "lat": 37.441944,
+        "lon": 129.291944,
+        "type": "FIX"
+      },
+      {
+        "name": "ESNEG",
+        "lat": 37.170556,
+        "lon": 129.8475,
+        "type": "FIX"
+      },
+      {
+        "name": "AGSUS",
+        "lat": 36.755833,
+        "lon": 130.678889,
+        "type": "FIX"
+      },
+      {
+        "name": "LANAT",
+        "lat": 36.373333,
+        "lon": 131.428333,
+        "type": "FIR_BDRY"
+      }
+    ],
+    "V11": [
+      {
+        "name": "PILIT",
+        "lat": 37.441944,
+        "lon": 129.291944,
+        "type": "FIX"
+      },
+      {
+        "name": "NOBUT",
+        "lat": 37.120833,
+        "lon": 129.3325,
+        "type": "FIX"
+      },
+      {
+        "name": "OSVOM",
+        "lat": 36.645556,
+        "lon": 129.391944,
+        "type": "FIX"
+      },
+      {
+        "name": "LOSTO",
+        "lat": 36.337778,
+        "lon": 129.43,
+        "type": "FIX"
+      },
+      {
+        "name": "POHANG VORTAC",
+        "lat": 35.977222,
+        "lon": 129.474444,
+        "type": "VORTAC",
+        "code": "KPO"
+      },
+      {
+        "name": "APARU",
+        "lat": 35.411667,
+        "lon": 129.158889,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      }
+    ],
+    "V543": [
+      {
+        "name": "DALSU",
+        "lat": 35.125278,
+        "lon": 126.701667,
+        "type": "FIX"
+      },
+      {
+        "name": "GWANGJU VOR",
+        "lat": 35.126111,
+        "lon": 126.812222,
+        "type": "VOR",
+        "code": "KWA"
+      },
+      {
+        "name": "SAMUL",
+        "lat": 35.126667,
+        "lon": 126.865,
+        "type": "FIX"
+      },
+      {
+        "name": "TEDAN",
+        "lat": 35.128889,
+        "lon": 127.314444,
+        "type": "FIX"
+      },
+      {
+        "name": "ANUBA",
+        "lat": 35.129444,
+        "lon": 127.589722,
+        "type": "FIX"
+      },
+      {
+        "name": "SAPDI",
+        "lat": 35.126944,
+        "lon": 128.497778,
+        "type": "FIX"
+      },
+      {
+        "name": "SARAM",
+        "lat": 35.126667,
+        "lon": 128.529722,
+        "type": "FIX"
+      },
+      {
+        "name": "ANKUS",
+        "lat": 35.125,
+        "lon": 128.771111,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      }
+    ],
+    "V547": [
+      {
+        "name": "GWANGJU VOR",
+        "lat": 35.126111,
+        "lon": 126.812222,
+        "type": "VOR",
+        "code": "KWA"
+      },
+      {
+        "name": "IGDOK",
+        "lat": 35.517778,
+        "lon": 127.818611,
+        "type": "FIX"
+      },
+      {
+        "name": "DALSEONG VORTAC",
+        "lat": 35.809722,
+        "lon": 128.590833,
+        "type": "VORTAC",
+        "code": "TGU"
+      }
+    ],
+    "V549": [
+      {
+        "name": "GUNSAN VORTAC",
+        "lat": 35.910278,
+        "lon": 126.611389,
+        "type": "VORTAC",
+        "code": "KUZ"
+      },
+      {
+        "name": "ELPOS",
+        "lat": 35.902778,
+        "lon": 126.785278,
+        "type": "FIX"
+      },
+      {
+        "name": "RINBO",
+        "lat": 35.897778,
+        "lon": 126.896944,
+        "type": "FIX"
+      },
+      {
+        "name": "MELES",
+        "lat": 35.880833,
+        "lon": 127.261667,
+        "type": "FIX"
+      },
+      {
+        "name": "OPEDA",
+        "lat": 35.863611,
+        "lon": 127.614444,
+        "type": "FIX"
+      },
+      {
+        "name": "DALSEONG VORTAC",
+        "lat": 35.809722,
+        "lon": 128.590833,
+        "type": "VORTAC",
+        "code": "TGU"
+      },
+      {
+        "name": "LAPAL",
+        "lat": 35.903611,
+        "lon": 129.081111,
+        "type": "FIX"
+      },
+      {
+        "name": "POHANG VORTAC",
+        "lat": 35.977222,
+        "lon": 129.474444,
+        "type": "VORTAC",
+        "code": "KPO"
+      }
+    ],
+    "W45": [
+      {
+        "name": "GWANGJU TACAN",
+        "lat": 35.123056,
+        "lon": 126.802778,
+        "type": "TACAN",
+        "code": "KWJ"
+      },
+      {
+        "name": "RIMPO",
+        "lat": 35.1275,
+        "lon": 127.583889,
+        "type": "FIX"
+      },
+      {
+        "name": "RUNIT",
+        "lat": 35.126111,
+        "lon": 128.497778,
+        "type": "FIX"
+      },
+      {
+        "name": "BUSAN VORTAC",
+        "lat": 35.1225,
+        "lon": 128.999444,
+        "type": "VORTAC",
+        "code": "PSN"
+      }
+    ],
+    "W61": [
+      {
+        "name": "SONGTAN VORTAC",
+        "lat": 37.094444,
+        "lon": 127.031667,
+        "type": "VORTAC",
+        "code": "SOT"
+      },
+      {
+        "name": "MONSI",
+        "lat": 37.213056,
+        "lon": 126.8375,
+        "type": "FIX"
+      },
+      {
+        "name": "GOGET",
+        "lat": 37.411667,
+        "lon": 126.51,
+        "type": "FIX"
+      }
+    ],
+    "W62": [
+      {
+        "name": "SONGTAN VORTAC",
+        "lat": 37.094444,
+        "lon": 127.031667,
+        "type": "VORTAC",
+        "code": "SOT"
+      },
+      {
+        "name": "EGOBA",
+        "lat": 37.4875,
+        "lon": 127.379444,
+        "type": "FIX"
+      }
+    ],
+    "W526": [
+      {
+        "name": "DALSEONG VORTAC",
+        "lat": 35.809722,
+        "lon": 128.590833,
+        "type": "VORTAC",
+        "code": "TGU"
+      },
+      {
+        "name": "MASTA",
+        "lat": 35.479722,
+        "lon": 128.561111,
+        "type": "FIX"
+      },
+      {
+        "name": "SARAM",
+        "lat": 35.126667,
+        "lon": 128.529722,
+        "type": "FIX"
+      },
+      {
+        "name": "TOPAX",
+        "lat": 34.765278,
+        "lon": 128.497778,
+        "type": "FIX"
+      }
+    ]
+  },
+  "waypoints": [
+    {
+      "name": "ATOTI",
+      "lat": 30.003611,
+      "lon": 125.198333,
+      "type": "FIR_BDRY",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "TESIM",
+      "lat": 31.590556,
+      "lon": 125.857778,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "LAMEN",
+      "lat": 31.61,
+      "lon": 124.0,
+      "type": "FIR_BDRY",
+      "routes": [
+        "A593"
+      ]
+    },
+    {
+      "name": "ELGEP",
+      "lat": 31.781389,
+      "lon": 125.938056,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "SADLI",
+      "lat": 31.83,
+      "lon": 125.0,
+      "type": "FIX",
+      "routes": [
+        "A593"
+      ]
+    },
+    {
+      "name": "PONIK",
+      "lat": 32.005833,
+      "lon": 125.783056,
+      "type": "FIX",
+      "routes": [
+        "A593"
+      ]
+    },
+    {
+      "name": "NIRAT",
+      "lat": 32.065,
+      "lon": 126.058056,
+      "type": "FIX",
+      "routes": [
+        "A593",
+        "B576"
+      ]
+    },
+    {
+      "name": "ONIKU",
+      "lat": 32.195,
+      "lon": 126.654722,
+      "type": "FIR_BDRY",
+      "routes": [
+        "A593"
+      ]
+    },
+    {
+      "name": "RUGMA",
+      "lat": 32.503333,
+      "lon": 126.964722,
+      "type": "FIR_BDRY",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "SAMLO",
+      "lat": 32.539722,
+      "lon": 126.26,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "SOSDO",
+      "lat": 33.003333,
+      "lon": 126.459722,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "TOSAN",
+      "lat": 33.003333,
+      "lon": 126.771944,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "JEJU VORTAC",
+      "lat": 33.384722,
+      "lon": 126.624167,
+      "type": "VORTAC",
+      "routes": [
+        "A586",
+        "A595",
+        "B576"
+      ],
+      "code": "CJU"
+    },
+    {
+      "name": "TAMNA",
+      "lat": 33.470833,
+      "lon": 127.331389,
+      "type": "FIX",
+      "routes": [
+        "A595"
+      ]
+    },
+    {
+      "name": "SAMDO",
+      "lat": 33.584167,
+      "lon": 128.315833,
+      "type": "FIR_BDRY",
+      "routes": [
+        "A595"
+      ]
+    },
+    {
+      "name": "MANOL",
+      "lat": 33.608056,
+      "lon": 126.920556,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "ATINA",
+      "lat": 33.722222,
+      "lon": 127.073056,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "MAKET",
+      "lat": 33.914444,
+      "lon": 127.331389,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "IPDAS",
+      "lat": 34.254167,
+      "lon": 126.716944,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "GOSBO",
+      "lat": 34.254722,
+      "lon": 127.792778,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "APELA",
+      "lat": 34.723056,
+      "lon": 129.233333,
+      "type": "FIR_BDRY",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "TOPAX",
+      "lat": 34.765278,
+      "lon": 128.497778,
+      "type": "FIX",
+      "routes": [
+        "A586",
+        "W526"
+      ]
+    },
+    {
+      "name": "INVOK",
+      "lat": 34.788611,
+      "lon": 129.323056,
+      "type": "FIR_BDRY",
+      "routes": [
+        "G339"
+      ]
+    },
+    {
+      "name": "OMOTU",
+      "lat": 35.009167,
+      "lon": 128.839444,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "BUSAN VORTAC",
+      "lat": 35.1225,
+      "lon": 128.999444,
+      "type": "VORTAC",
+      "routes": [
+        "A582",
+        "A586",
+        "G339",
+        "V11",
+        "V543",
+        "W45"
+      ],
+      "code": "PSN"
+    },
+    {
+      "name": "GWANGJU TACAN",
+      "lat": 35.123056,
+      "lon": 126.802778,
+      "type": "TACAN",
+      "routes": [
+        "W45"
+      ],
+      "code": "KWJ"
+    },
+    {
+      "name": "ANKUS",
+      "lat": 35.125,
+      "lon": 128.771111,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "DALSU",
+      "lat": 35.125278,
+      "lon": 126.701667,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "GWANGJU VOR",
+      "lat": 35.126111,
+      "lon": 126.812222,
+      "type": "VOR",
+      "routes": [
+        "B576",
+        "V543",
+        "V547"
+      ],
+      "code": "KWA"
+    },
+    {
+      "name": "RUNIT",
+      "lat": 35.126111,
+      "lon": 128.497778,
+      "type": "FIX",
+      "routes": [
+        "W45"
+      ]
+    },
+    {
+      "name": "SAMUL",
+      "lat": 35.126667,
+      "lon": 126.865,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "SARAM",
+      "lat": 35.126667,
+      "lon": 128.529722,
+      "type": "FIX",
+      "routes": [
+        "V543",
+        "W526"
+      ]
+    },
+    {
+      "name": "SAPDI",
+      "lat": 35.126944,
+      "lon": 128.497778,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "RIMPO",
+      "lat": 35.1275,
+      "lon": 127.583889,
+      "type": "FIX",
+      "routes": [
+        "W45"
+      ]
+    },
+    {
+      "name": "TEDAN",
+      "lat": 35.128889,
+      "lon": 127.314444,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "ANUBA",
+      "lat": 35.129444,
+      "lon": 127.589722,
+      "type": "FIX",
+      "routes": [
+        "V543"
+      ]
+    },
+    {
+      "name": "APARU",
+      "lat": 35.411667,
+      "lon": 129.158889,
+      "type": "FIX",
+      "routes": [
+        "V11"
+      ]
+    },
+    {
+      "name": "BEDOM",
+      "lat": 35.420278,
+      "lon": 129.298333,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "MASTA",
+      "lat": 35.479722,
+      "lon": 128.561111,
+      "type": "FIX",
+      "routes": [
+        "W526"
+      ]
+    },
+    {
+      "name": "KALOD",
+      "lat": 35.503333,
+      "lon": 128.773889,
+      "type": "FIX",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "IGDOK",
+      "lat": 35.517778,
+      "lon": 127.818611,
+      "type": "FIX",
+      "routes": [
+        "V547"
+      ]
+    },
+    {
+      "name": "LINTA",
+      "lat": 35.521111,
+      "lon": 126.855278,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "DALSEONG VORTAC",
+      "lat": 35.809722,
+      "lon": 128.590833,
+      "type": "VORTAC",
+      "routes": [
+        "A582",
+        "V547",
+        "V549",
+        "W526"
+      ],
+      "code": "TGU"
+    },
+    {
+      "name": "SAPRA",
+      "lat": 35.823889,
+      "lon": 130.723611,
+      "type": "FIR_BDRY",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "OPEDA",
+      "lat": 35.863611,
+      "lon": 127.614444,
+      "type": "FIX",
+      "routes": [
+        "V549"
+      ]
+    },
+    {
+      "name": "MELES",
+      "lat": 35.880833,
+      "lon": 127.261667,
+      "type": "FIX",
+      "routes": [
+        "V549"
+      ]
+    },
+    {
+      "name": "RINBO",
+      "lat": 35.897778,
+      "lon": 126.896944,
+      "type": "FIX",
+      "routes": [
+        "B576",
+        "V549"
+      ]
+    },
+    {
+      "name": "ELPOS",
+      "lat": 35.902778,
+      "lon": 126.785278,
+      "type": "FIX",
+      "routes": [
+        "V549"
+      ]
+    },
+    {
+      "name": "LAPAL",
+      "lat": 35.903611,
+      "lon": 129.081111,
+      "type": "FIX",
+      "routes": [
+        "V549"
+      ]
+    },
+    {
+      "name": "GUNSAN VORTAC",
+      "lat": 35.910278,
+      "lon": 126.611389,
+      "type": "VORTAC",
+      "routes": [
+        "V549"
+      ],
+      "code": "KUZ"
+    },
+    {
+      "name": "BULGA",
+      "lat": 35.935833,
+      "lon": 129.823333,
+      "type": "FIX",
+      "routes": [
+        "A586",
+        "G585"
+      ]
+    },
+    {
+      "name": "POHANG VORTAC",
+      "lat": 35.977222,
+      "lon": 129.474444,
+      "type": "VORTAC",
+      "routes": [
+        "G585",
+        "V11",
+        "V549"
+      ],
+      "code": "KPO"
+    },
+    {
+      "name": "BITUX",
+      "lat": 36.279167,
+      "lon": 128.03,
+      "type": "FIX",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "DABIK",
+      "lat": 36.295278,
+      "lon": 130.195278,
+      "type": "FIX",
+      "routes": [
+        "A586"
+      ]
+    },
+    {
+      "name": "ELAPI",
+      "lat": 36.337222,
+      "lon": 128.8475,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "LOSTO",
+      "lat": 36.337778,
+      "lon": 129.43,
+      "type": "FIX",
+      "routes": [
+        "V11"
+      ]
+    },
+    {
+      "name": "LANAT",
+      "lat": 36.373333,
+      "lon": 131.428333,
+      "type": "FIR_BDRY",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "ENTEL",
+      "lat": 36.386389,
+      "lon": 126.951389,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "MAKDU",
+      "lat": 36.453333,
+      "lon": 127.819167,
+      "type": "FIX",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "YECHEON VOR",
+      "lat": 36.631944,
+      "lon": 128.325278,
+      "type": "VOR",
+      "routes": [
+        "G585"
+      ],
+      "code": "CUN"
+    },
+    {
+      "name": "OSVOM",
+      "lat": 36.645556,
+      "lon": 129.391944,
+      "type": "FIX",
+      "routes": [
+        "V11"
+      ]
+    },
+    {
+      "name": "VASLI",
+      "lat": 36.714444,
+      "lon": 127.500833,
+      "type": "FIX",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "BIGOB",
+      "lat": 36.723611,
+      "lon": 128.164444,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "OLMEN",
+      "lat": 36.736944,
+      "lon": 126.991111,
+      "type": "FIX",
+      "routes": [
+        "B576"
+      ]
+    },
+    {
+      "name": "AGSUS",
+      "lat": 36.755833,
+      "lon": 130.678889,
+      "type": "FIX",
+      "routes": [
+        "A586",
+        "G597"
+      ]
+    },
+    {
+      "name": "OSPOT",
+      "lat": 36.838333,
+      "lon": 127.348611,
+      "type": "FIX",
+      "routes": [
+        "A582"
+      ]
+    },
+    {
+      "name": "BASEM",
+      "lat": 36.843611,
+      "lon": 127.952778,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "ENSAL",
+      "lat": 36.931667,
+      "lon": 127.796389,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "GUKDO",
+      "lat": 37.019722,
+      "lon": 127.639722,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "SONGTAN VORTAC",
+      "lat": 37.094444,
+      "lon": 127.031667,
+      "type": "VORTAC",
+      "routes": [
+        "A582",
+        "B576",
+        "W61",
+        "W62"
+      ],
+      "code": "SOT"
+    },
+    {
+      "name": "NOBUT",
+      "lat": 37.120833,
+      "lon": 129.3325,
+      "type": "FIX",
+      "routes": [
+        "V11"
+      ]
+    },
+    {
+      "name": "KAKSO",
+      "lat": 37.129167,
+      "lon": 127.443611,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "AGAVO",
+      "lat": 37.166667,
+      "lon": 124.0,
+      "type": "FIR_BDRY",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "ESNEG",
+      "lat": 37.170556,
+      "lon": 129.8475,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "GONAV",
+      "lat": 37.18,
+      "lon": 124.414722,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "MONSI",
+      "lat": 37.213056,
+      "lon": 126.8375,
+      "type": "FIX",
+      "routes": [
+        "W61"
+      ]
+    },
+    {
+      "name": "POLEG",
+      "lat": 37.213611,
+      "lon": 126.993056,
+      "type": "FIX",
+      "routes": [
+        "A582",
+        "B576"
+      ]
+    },
+    {
+      "name": "DANTI",
+      "lat": 37.301667,
+      "lon": 124.658056,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "KALMA",
+      "lat": 37.3125,
+      "lon": 127.1125,
+      "type": "FIX",
+      "routes": [
+        "G585"
+      ]
+    },
+    {
+      "name": "IGRAS",
+      "lat": 37.312778,
+      "lon": 132.736389,
+      "type": "FIR_BDRY",
+      "routes": [
+        "B332"
+      ]
+    },
+    {
+      "name": "ANSIM",
+      "lat": 37.389722,
+      "lon": 124.835833,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "BINIL",
+      "lat": 37.396944,
+      "lon": 125.233056,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "NOPIK",
+      "lat": 37.403333,
+      "lon": 125.651389,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "GOGET",
+      "lat": 37.411667,
+      "lon": 126.51,
+      "type": "FIX",
+      "routes": [
+        "G597",
+        "W61"
+      ]
+    },
+    {
+      "name": "ANYANG VORTAC",
+      "lat": 37.413611,
+      "lon": 126.928333,
+      "type": "VORTAC",
+      "routes": [
+        "A582",
+        "B576",
+        "G585",
+        "G597"
+      ],
+      "code": "SEL"
+    },
+    {
+      "name": "PILIT",
+      "lat": 37.441944,
+      "lon": 129.291944,
+      "type": "FIX",
+      "routes": [
+        "G597",
+        "V11"
+      ]
+    },
+    {
+      "name": "EGOBA",
+      "lat": 37.4875,
+      "lon": 127.379444,
+      "type": "FIX",
+      "routes": [
+        "G597",
+        "W62"
+      ]
+    },
+    {
+      "name": "KARBU",
+      "lat": 37.533056,
+      "lon": 127.664444,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "TORUS",
+      "lat": 37.606944,
+      "lon": 128.135278,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "TENAS",
+      "lat": 37.638889,
+      "lon": 131.574167,
+      "type": "FIX",
+      "routes": [
+        "A586",
+        "B467"
+      ]
+    },
+    {
+      "name": "SABET",
+      "lat": 37.641389,
+      "lon": 132.671944,
+      "type": "FIX",
+      "routes": [
+        "B332"
+      ]
+    },
+    {
+      "name": "BIKSI",
+      "lat": 37.675556,
+      "lon": 128.584444,
+      "type": "FIX",
+      "routes": [
+        "G597"
+      ]
+    },
+    {
+      "name": "BUSKO",
+      "lat": 37.675833,
+      "lon": 130.269444,
+      "type": "FIX",
+      "routes": [
+        "B467"
+      ]
+    },
+    {
+      "name": "UGOVI",
+      "lat": 37.684722,
+      "lon": 129.8475,
+      "type": "FIX",
+      "routes": [
+        "B467"
+      ]
+    },
+    {
+      "name": "LESBU",
+      "lat": 37.687778,
+      "lon": 129.684444,
+      "type": "FIX",
+      "routes": [
+        "B467"
+      ]
+    },
+    {
+      "name": "GANGWON VORTAC",
+      "lat": 37.700833,
+      "lon": 128.753889,
+      "type": "VORTAC",
+      "routes": [
+        "B467",
+        "G597"
+      ],
+      "code": "KAE"
+    },
+    {
+      "name": "MALSO",
+      "lat": 37.911111,
+      "lon": 131.817778,
+      "type": "FIX",
+      "routes": [
+        "B467"
+      ]
+    },
+    {
+      "name": "PALDU",
+      "lat": 37.970278,
+      "lon": 132.606944,
+      "type": "FIX",
+      "routes": [
+        "B332"
+      ]
+    },
+    {
+      "name": "KANSU",
+      "lat": 38.633333,
+      "lon": 132.475,
+      "type": "FIR_BDRY",
+      "routes": [
+        "B332",
+        "B467"
+      ]
+    }
+  ],
+  "stats": {
+    "total_routes": 18,
+    "total_waypoints": 99
+  }
+}
