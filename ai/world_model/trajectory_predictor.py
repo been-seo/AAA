@@ -391,14 +391,15 @@ class TrajectoryPredictor(nn.Module):
         kl = 0.5 * (var1 / var2 + (mean2 - mean1).pow(2) / var2 - 1 + 2 * (logstd2 - logstd1))
         return kl.sum(dim=-1)
 
-    # ── Inner task 이름 (PAVING K=11) ──
+    # ── Inner task 이름 (PAVING K=9, redundancy 제거) ──
+    # 실측 gradient cos 분석 결과 (models/world_model/gradient_redundancy.json):
+    #   - heading_circ와 track_sin: |cos|=0.776 → 중복, 제거
+    #   - kl: gradient ≈ 0 (free_nats clamp), inner task 자격 없음 — 별도 regularizer
     INNER_TASKS = [
-        'pos_lat', 'pos_lon',        # Position (2)
-        'alt', 'vrate',               # Vertical (2)
-        'gs', 'ias', 'mach',          # Speed (3)
-        'track_sin', 'track_cos',    # Heading circular (2)
-        'heading_circ',               # Direct heading loss
-        'kl',                         # Latent
+        'pos_lat', 'pos_lon',      # Position (2)
+        'alt', 'vrate',             # Vertical (2)
+        'gs', 'ias', 'mach',        # Speed (3; ias/mach는 |cos|=0.33 관찰)
+        'track_sin', 'track_cos',  # Heading circular (2, 직교 확인)
     ]
 
     def compute_loss(self, past_states, future_states, contexts,
@@ -439,7 +440,7 @@ class TrajectoryPredictor(nn.Module):
         tl['ias'] = (pred[:, :, 6] - target[:, :, 6]).pow(2).mean()
         tl['mach'] = (pred[:, :, 7] - target[:, :, 7]).pow(2).mean()
 
-        # Heading: sin/cos decomposition (circular-safe)
+        # Heading: sin/cos decomposition (circular-safe, 직교)
         # track is normalized by 180, so approximate unnorm:
         pred_track_deg = pred[:, :, 4] * 180.0
         tgt_track_deg = target[:, :, 4] * 180.0
@@ -448,31 +449,25 @@ class TrajectoryPredictor(nn.Module):
         tl['track_sin'] = (torch.sin(pred_track_rad) - torch.sin(tgt_track_rad)).pow(2).mean()
         tl['track_cos'] = (torch.cos(pred_track_rad) - torch.cos(tgt_track_rad)).pow(2).mean()
 
-        # Circular heading direct loss
-        diff_deg = (pred_track_deg - tgt_track_deg + 180.0) % 360.0 - 180.0
-        diff_norm = diff_deg / 180.0
-        tl['heading_circ'] = (diff_norm ** 2).mean()
-
-        # ── KL with free bits ──
-        # Inner task loss는 raw로 유지 (PAVING 가중치 계산 정확도 위해)
-        kl_per_step = output['kl_loss'].mean(dim=0)  # (K,)
+        # ── KL (inner task 외부, regularizer만) ──
+        # free_nats로 clamp되어 gradient가 거의 0이므로 inner task로 부적합
+        # (gradient_redundancy.json: kl row/col 모두 cos≈0)
+        kl_per_step = output['kl_loss'].mean(dim=0)
         T = kl_per_step.shape[0]
         kl_with_min = torch.clamp(kl_per_step, min=kl_min_nats)
         kl_total = torch.clamp(kl_with_min.sum() - free_nats_per_step * T, min=0)
-        tl['kl'] = kl_total  # raw, 가중치는 task_weights로 제어
 
         # ── Weighted aggregation ──
-        # kl_weight는 kl task의 기본 weight로 적용 (raw 값은 task_losses에 유지)
         if task_weights is None:
             task_weights = {k: 1.0 for k in self.INNER_TASKS}
-            task_weights['kl'] = kl_weight  # KL 기본 스케일
 
-        total_loss = sum(tl[k] * task_weights.get(k, 1.0)
+        recon_loss = sum(tl[k] * task_weights.get(k, 1.0)
                          for k in self.INNER_TASKS)
+        total_loss = recon_loss + kl_weight * kl_total
 
         return {
             'total_loss': total_loss,
-            'task_losses': tl,
-            'recon_loss': total_loss - tl['kl'] * task_weights.get('kl', 1.0),
-            'kl_loss': tl['kl'],
+            'task_losses': tl,           # K=9 (KL 제외)
+            'recon_loss': recon_loss,
+            'kl_loss': kl_total,         # regularizer
         }
