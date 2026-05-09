@@ -43,9 +43,12 @@ from config import (
 from core.simulation import Simulation
 from core.airspace import AirspaceManager
 from ai.safety_advisor import SafetyAdvisor, Severity
-from ai.world_model.trajectory_predictor import TrajectoryPredictor
+from ai.world_model.physics_wm import PhysicsWM
 from ai.world_model.conflict_detector import ConflictDetector
-from ai.world_model.dataset import STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM
+from ai.world_model.dataset import (
+    STATE_DIM, NORM_MEAN, NORM_STD, MAX_NEIGHBORS, CONTEXT_DIM, WORLD_DIM,
+    _load_waypoints, _get_nearest_waypoints_batch,
+)
 from utils import render_text_with_simple_outline
 
 # ── 설정 ──
@@ -66,15 +69,36 @@ def load_model(model_path, device):
         return None
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     args = checkpoint.get('args', {})
-    model = TrajectoryPredictor(
+    model = PhysicsWM(
         hidden_dim=args.get('hidden_dim', 256),
-        latent_dim=args.get('latent_dim', 64),
+        past_steps=args.get('past_steps', PAST_STEPS),
     ).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     epoch = checkpoint.get('epoch', '?')
     print(f"[ATC] World Model loaded (epoch={epoch})")
     return model
+
+
+_WP_CACHE = None
+def _get_wp_cache():
+    global _WP_CACHE
+    if _WP_CACHE is None:
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        _WP_CACHE = _load_waypoints(data_dir)
+    return _WP_CACHE
+
+
+def _compute_world_past(past_raw, device):
+    """past_raw (K, STATE_DIM) numpy → (1, K, WORLD_DIM) tensor."""
+    wp_data = _get_wp_cache()
+    if wp_data is None:
+        return None
+    wp_array, wp_types, _ = wp_data
+    feat = _get_nearest_waypoints_batch(
+        past_raw[:, 0], past_raw[:, 1], past_raw[:, 4],
+        wp_array, wp_types, k=3)
+    return torch.from_numpy(feat).unsqueeze(0).to(device)  # (1, K, WORLD_DIM)
 
 
 
@@ -351,7 +375,9 @@ def predict_trajectories(model, history, icao, device, future_steps=12, num_mc=M
     ctx_list = [history.get_context(icao) for _ in range(PAST_STEPS)]
     ctx = np.stack(ctx_list)
     ctx_t = torch.from_numpy(ctx).unsqueeze(0).to(device)
-    trajs = model.predict(past_t, ctx_t, num_samples=num_mc, future_steps=future_steps)
+    world_past = _compute_world_past(past, device)
+    trajs = model.predict(past_t, ctx_t, num_samples=num_mc, future_steps=future_steps,
+                          world_past=world_past)
     return trajs[0, :, :, :3].cpu().numpy()
 
 
@@ -908,6 +934,14 @@ def main():
             # 선택 항공기 제외 (아래서 별도 표시)
             conflict_icaos.discard(selected_icao)
 
+            # 충돌 확률 비교용 기준 궤적: 선택 항공기 예측 (없으면 linear)
+            ref_traj = None
+            if pred_trajs is not None:
+                ref_traj = np.median(pred_trajs, axis=0)  # (T, 3)
+            elif sim.selected_aircraft:
+                ref_traj = linear_extrapolate(
+                    sim.selected_aircraft, steps=future_steps)
+
             for c_icao in conflict_icaos:
                 ac = all_tracked.get(c_icao)
                 if not ac:
@@ -925,37 +959,55 @@ def main():
                     lin = linear_extrapolate(ac, steps=future_steps)
                     c_traj = lin[np.newaxis, :, :]  # (1, T, 3)
 
-                # MC 샘플 범위 그리기 (빨간색)
                 mc, T, _ = c_traj.shape
-                for s_idx in range(mc):
-                    pts = []
-                    for t in range(T):
-                        lat, lon = c_traj[s_idx, t, 0], c_traj[s_idx, t, 1]
-                        sx, sy = sim.map.latlon_to_screen(lat, lon)
-                        pts.append((int(sx), int(sy)))
-                    if len(pts) > 1:
-                        pygame.draw.lines(sim.screen, (255, 80, 80), False, pts, 1)
-                # 중앙 궤적 굵게
+                # 중앙 궤적 (가장 확률 높은 = median)
                 median_traj = np.median(c_traj, axis=0)  # (T, 3)
+
+                # 충돌 확률 가장 높은 MC sample = ref_traj와 최근접 거리 최소인 샘플
+                worst_idx = None
+                if ref_traj is not None and mc > 1 and T > 0:
+                    Tc = min(T, ref_traj.shape[0])
+                    dlat = (c_traj[:, :Tc, 0] - ref_traj[:Tc, 0]) * 60.0
+                    cos_lat = np.cos(np.radians(
+                        (c_traj[:, :Tc, 0] + ref_traj[:Tc, 0]) / 2.0))
+                    dlon = ((c_traj[:, :Tc, 1] - ref_traj[:Tc, 1])
+                            * 60.0 * cos_lat)
+                    h_dist = np.sqrt(dlat**2 + dlon**2)  # (mc, Tc)
+                    min_dist_per_mc = h_dist.min(axis=1)
+                    worst_idx = int(min_dist_per_mc.argmin())
+
+                # 충돌 확률 가장 높은 샘플: 주황색 굵게
+                if worst_idx is not None:
+                    pts_w = []
+                    for t in range(T):
+                        sx, sy = sim.map.latlon_to_screen(
+                            c_traj[worst_idx, t, 0], c_traj[worst_idx, t, 1])
+                        pts_w.append((int(sx), int(sy)))
+                    if len(pts_w) > 1:
+                        pygame.draw.lines(sim.screen, (255, 165, 0),
+                                          False, pts_w, 3)
+
+                # 중앙(가장 확률 높은) 궤적: 빨간색 굵게
                 med_pts = []
                 for t in range(T):
-                    sx, sy = sim.map.latlon_to_screen(median_traj[t, 0], median_traj[t, 1])
+                    sx, sy = sim.map.latlon_to_screen(
+                        median_traj[t, 0], median_traj[t, 1])
                     med_pts.append((int(sx), int(sy)))
                 if len(med_pts) > 1:
-                    pygame.draw.lines(sim.screen, (255, 50, 50), False, med_pts, 3)
+                    pygame.draw.lines(sim.screen, (255, 50, 50),
+                                      False, med_pts, 3)
 
-        # ── 선택 항공기 예측 궤적 ──
+        # ── 선택 항공기 예측 궤적 — 가장 확률 높은(median)만 ──
         if pred_trajs is not None and selected_icao in all_tracked:
             mc, T, _ = pred_trajs.shape
-            for s_idx in range(mc):
-                pts = []
-                for t in range(T):
-                    lat, lon = pred_trajs[s_idx, t, 0], pred_trajs[s_idx, t, 1]
-                    sx, sy = sim.map.latlon_to_screen(lat, lon)
-                    pts.append((int(sx), int(sy)))
-                if len(pts) >= 2:
-                    for i in range(len(pts) - 1):
-                        pygame.draw.line(sim.screen, (0, 255, 200), pts[i], pts[i+1], 1)
+            median_pred = np.median(pred_trajs, axis=0)
+            pts = []
+            for t in range(T):
+                sx, sy = sim.map.latlon_to_screen(
+                    median_pred[t, 0], median_pred[t, 1])
+                pts.append((int(sx), int(sy)))
+            if len(pts) >= 2:
+                pygame.draw.lines(sim.screen, (0, 255, 200), False, pts, 2)
 
             if mc > 1:
                 final_lats = pred_trajs[:, -1, 0]
@@ -1023,6 +1075,33 @@ def main():
                 sim.screen.blit(lbl, (px - lbl.get_width() // 2, py + 12))
 
         font = sim.font
+
+        # ── 시나리오 웨이포인트 경로 (HUD보다 먼저 그려서 HUD가 가리도록) ──
+        for ac in sim.user_aircraft:
+            sc = scenarios.get(ac.callsign)
+            if not sc or sc.complete:
+                continue
+            ac_sx, ac_sy = sim.map.latlon_to_screen(ac.lat, ac.lon)
+            pts = [(int(ac_sx), int(ac_sy))]
+            for wlat, wlon, walt, wlabel in sc.remaining_waypoints:
+                wx, wy = sim.map.latlon_to_screen(wlat, wlon)
+                pts.append((int(wx), int(wy)))
+            if len(pts) >= 2:
+                pygame.draw.lines(sim.screen, YELLOW, False, pts, 2)
+                wp = sc.current_waypoint
+                if wp:
+                    brg, rng = get_wp_heading_and_dist(ac.lat, ac.lon, wp[0], wp[1])
+                    mid_x = (pts[0][0] + pts[1][0]) // 2
+                    mid_y = (pts[0][1] + pts[1][1]) // 2
+                    br_text = f"BRG {brg:.0f} / {rng:.1f}NM"
+                    s = render_text_with_simple_outline(font, br_text, YELLOW, BLACK)
+                    sim.screen.blit(s, (mid_x - s.get_width() // 2, mid_y - 12))
+            for i, (wlat, wlon, walt, wlabel) in enumerate(sc.waypoints):
+                sx, sy = sim.map.latlon_to_screen(wlat, wlon)
+                color = GREEN if i < sc.current_wp_idx else (YELLOW if i == sc.current_wp_idx else LIGHT_GRAY)
+                pygame.draw.circle(sim.screen, color, (int(sx), int(sy)), 6, 2)
+                s = font.render(f"{wlabel} FL{walt/100:.0f}", True, color)
+                sim.screen.blit(s, (int(sx) + 8, int(sy) - 8))
 
         # ── HUD (좌측 상단) ──
         sel_info = ""
@@ -1191,36 +1270,6 @@ def main():
                 s = render_text_with_simple_outline(font, line, col, BLACK)
                 sim.screen.blit(s, (ua_x + 8, uy))
                 uy += 22
-
-        # ── 시나리오 웨이포인트 경로 & 패널 ──
-        for ac in sim.user_aircraft:
-            sc = scenarios.get(ac.callsign)
-            if not sc or sc.complete:
-                continue
-            # 웨이포인트 경로선 + Bearing/Range 그리기
-            ac_sx, ac_sy = sim.map.latlon_to_screen(ac.lat, ac.lon)
-            pts = [(int(ac_sx), int(ac_sy))]
-            for wlat, wlon, walt, wlabel in sc.remaining_waypoints:
-                wx, wy = sim.map.latlon_to_screen(wlat, wlon)
-                pts.append((int(wx), int(wy)))
-            if len(pts) >= 2:
-                pygame.draw.lines(sim.screen, YELLOW, False, pts, 2)
-                # 경로선 중간에 Bearing/Range 표시
-                wp = sc.current_waypoint
-                if wp:
-                    brg, rng = get_wp_heading_and_dist(ac.lat, ac.lon, wp[0], wp[1])
-                    mid_x = (pts[0][0] + pts[1][0]) // 2
-                    mid_y = (pts[0][1] + pts[1][1]) // 2
-                    br_text = f"BRG {brg:.0f} / {rng:.1f}NM"
-                    s = render_text_with_simple_outline(font, br_text, YELLOW, BLACK)
-                    sim.screen.blit(s, (mid_x - s.get_width() // 2, mid_y - 12))
-            # 웨이포인트 마커
-            for i, (wlat, wlon, walt, wlabel) in enumerate(sc.waypoints):
-                sx, sy = sim.map.latlon_to_screen(wlat, wlon)
-                color = GREEN if i < sc.current_wp_idx else (YELLOW if i == sc.current_wp_idx else LIGHT_GRAY)
-                pygame.draw.circle(sim.screen, color, (int(sx), int(sy)), 6, 2)
-                s = font.render(f"{wlabel} FL{walt/100:.0f}", True, color)
-                sim.screen.blit(s, (int(sx) + 8, int(sy) - 8))
 
         # 선택 항공기 시나리오 패널 (좌측 중간)
         if sim.selected_aircraft:

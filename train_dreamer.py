@@ -20,7 +20,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ai.world_model.trajectory_predictor import TrajectoryPredictor
+from ai.world_model.physics_wm import PhysicsWM
 from ai.world_model.dataset import TrajectoryDataset, STATE_DIM, NORM_MEAN, NORM_STD
 from ai.world_model.dreamer_policy import DreamerTrainer
 
@@ -46,9 +46,12 @@ def create_db_logger(db_path):
     """)
     # 축별 컬럼 추가 (기존 DB 호환)
     for col in ['v_safety', 'v_efficiency', 'v_mission', 'w_safety', 'w_efficiency', 'w_mission',
-                 'r_safety', 'r_efficiency', 'r_mission', 'v_crash', 'v_safe']:
+                 'r_safety', 'r_efficiency', 'r_mission', 'v_crash', 'v_safe',
+                 'paving_regroups', 'paving_max_inter_cos', 'regrouped',
+                 'reached', 'fuel_empty', 'avg_ep_len',
+                 'min_gap', 'auc_5', 'auc_10', 'auc_20', 'auc_any']:
         try:
-            conn.execute(f"ALTER TABLE dreamer_steps ADD COLUMN {col} REAL DEFAULT 0")
+            conn.execute(f"ALTER TABLE dreamer_steps ADD COLUMN {col} REAL DEFAULT NULL")
         except Exception:
             pass  # 이미 존재
     conn.commit()
@@ -65,9 +68,9 @@ def load_world_model(path, device):
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     args = ckpt.get('args', {})
-    model = TrajectoryPredictor(
+    model = PhysicsWM(
         hidden_dim=args.get('hidden_dim', 256),
-        latent_dim=args.get('latent_dim', 64),
+        past_steps=args.get('past_steps', 6),
     ).to(device)
     model.load_state_dict(ckpt['model_state_dict'])
     epoch = ckpt.get('epoch', '?')
@@ -97,13 +100,20 @@ def main():
     parser.add_argument('--save-dir', default='models/dreamer')
     parser.add_argument('--log-db', default='models/dreamer/train_log.db')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--horizon', type=int, default=16)
+    parser.add_argument('--horizon', type=int, default=120,
+                        help='Max episode horizon (cap). Episodes terminate on '
+                             'reached-destination or fuel-empty before this.')
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--total-steps', type=int, default=100000)
     parser.add_argument('--wm-reload-interval', type=int, default=50,
                         help='WM 리로드 체크 주기 (스텝)')
     parser.add_argument('--save-interval', type=int, default=200)
     parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--kst-hours', type=str, default=None,
+                        help='KST 시간 필터 "start-end" 형식. 예: "8-16" = '
+                             '08:00~16:00 KST. 미지정 시 전체 시간대.')
+    parser.add_argument('--weekday-only', action='store_true',
+                        help='주말(토/일) 제외, 평일만 사용.')
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -122,9 +132,21 @@ def main():
         print("[Dreamer] No recording files found!")
         return
 
-    # 학습 데이터 로드 + 메모리 프리로드
-    dataset = TrajectoryDataset(rec_dir, past_steps=6, future_steps=12, stride=2)
-    print(f"[Dreamer] Dataset: {len(dataset)} samples")
+    # 학습 데이터 로드 + 메모리 프리로드 (--kst-hours로 시간대 필터링 가능)
+    time_filter = None
+    tf_tag = ''
+    if args.kst_hours:
+        try:
+            h_s, h_e = args.kst_hours.split('-')
+            time_filter = (int(h_s), int(h_e))
+            tf_tag = f' (KST {time_filter[0]:02d}-{time_filter[1]:02d})'
+        except (ValueError, IndexError):
+            print(f"[Dreamer] --kst-hours 형식 오류 '{args.kst_hours}', 무시")
+    dataset = TrajectoryDataset(rec_dir, past_steps=6, future_steps=12,
+                                stride=2, time_filter=time_filter,
+                                weekday_only=args.weekday_only)
+    wk_tag = ' + weekday' if args.weekday_only else ''
+    print(f"[Dreamer] Dataset: {len(dataset)} samples{tf_tag}{wk_tag}")
     dataset.preload()
 
     if len(dataset) == 0:
@@ -191,8 +213,11 @@ def main():
                    (step, timestamp, actor_loss, critic_loss, mean_reward, mean_value,
                     crashes, entropy, total_episodes, total_crashes, total_safe,
                     v_safety, v_efficiency, v_mission, w_safety, w_efficiency, w_mission,
-                    r_safety, r_efficiency, r_mission, v_crash, v_safe)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    r_safety, r_efficiency, r_mission, v_crash, v_safe,
+                    paving_regroups, paving_max_inter_cos, regrouped,
+                    reached, fuel_empty, avg_ep_len,
+                    min_gap, auc_5, auc_10, auc_20, auc_any)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (step, time.time(),
                  metrics['actor_loss'], metrics['critic_loss'],
                  metrics['mean_reward'], metrics['mean_value'],
@@ -204,22 +229,49 @@ def main():
                  metrics.get('w_efficiency', 0), metrics.get('w_mission', 0),
                  metrics.get('r_safety', 0), metrics.get('r_efficiency', 0),
                  metrics.get('r_mission', 0),
-                 metrics.get('v_crash', 0), metrics.get('v_safe', 0)))
+                 metrics.get('v_crash', None),  # None → NULL
+                 metrics.get('v_safe', None),
+                 metrics.get('paving_regroups', 0),
+                 metrics.get('paving_max_inter_cos', 0),
+                 1 if metrics.get('regrouped', False) else 0,
+                 metrics.get('reached', 0),
+                 metrics.get('fuel_empty', 0),
+                 metrics.get('avg_ep_len', 0),
+                 metrics.get('min_gap', None),
+                 metrics.get('auc_5', None),
+                 metrics.get('auc_10', None),
+                 metrics.get('auc_20', None),
+                 metrics.get('auc_any', None)))
             db.commit()
 
             crash_rate = (trainer.total_crashes / max(trainer.total_episodes, 1)) * 100
             vs = f"V=[S{metrics.get('v_safety',0):.1f}/E{metrics.get('v_efficiency',0):.1f}/M{metrics.get('v_mission',0):.1f}]"
             rs = f"R=[S{metrics.get('r_safety',0):.1f}/E{metrics.get('r_efficiency',0):.1f}/M{metrics.get('r_mission',0):.1f}]"
             cl = f"CL=[S{metrics.get('c_safety',0):.0f}/E{metrics.get('c_efficiency',0):.0f}/M{metrics.get('c_mission',0):.0f}]"
-            vc = metrics.get('v_crash', 0)
-            vf = metrics.get('v_safe', 0)
+            vc = metrics.get('v_crash', None)
+            vf = metrics.get('v_safe', None)
             cos = metrics.get('max_cos_sim', 0)
             cert = metrics.get('certificate_h', 0)
-            print(f"[{step:6d}] {vs} {rs} {cl} "
-                  f"Vc={vc:.1f}/Vs={vf:.1f} "
-                  f"crash={metrics['crashes']} "
+            reached = metrics.get('reached', 0)
+            fuel_empty = metrics.get('fuel_empty', 0)
+            ep_len = metrics.get('avg_ep_len', 0)
+            stage = metrics.get('curriculum_stage', 1)
+            def _fmt_auc(v):
+                return f"{v:.3f}" if v is not None else "----"
+            def _fmt_v(v):
+                return f"{v:+.1f}" if v is not None else "--"
+
+            # Prediction accuracy: "Critic가 매 순간 위험 상태를 정상 상태보다
+            # 더 위험하게 평가한 비율" — 5-step lookahead AUC
+            pred_acc = metrics.get('auc_5')
+            mg = metrics.get('min_gap')
+            mg_str = f"{mg:+.1f}" if mg is not None else "--"
+            print(f"[{step:6d}] PRED={_fmt_auc(pred_acc)} "
+                  f"mingap={mg_str} "
+                  f"Vc={_fmt_v(vc)}/Vs={_fmt_v(vf)} "
+                  f"crash={metrics['crashes']} reach={reached} "
+                  f"fuel0={fuel_empty} len={ep_len:.0f} "
                   f"ent={metrics['entropy']:.3f} "
-                  f"cos={cos:.2f} h={cert:.1f} "
                   f"| {trainer.total_episodes}ep "
                   f"{crash_rate:.1f}%")
 

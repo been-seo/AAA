@@ -44,12 +44,15 @@ HTML = """
   <div class="card"><h3>Axis Rewards (Safety / Efficiency / Mission)</h3><canvas id="axisRewardChart"></canvas></div>
   <div class="card"><h3>Entropy</h3><canvas id="entropyChart"></canvas></div>
   <div class="card"><h3>Critic: V_crash vs V_safe</h3><canvas id="vcvsChart"></canvas></div>
+  <div class="card"><h3>Min Gap (worst-case state separation)</h3><canvas id="minGapChart"></canvas></div>
+  <div class="card"><h3>PRED (AUC[5] crash prediction)</h3><canvas id="predChart"></canvas></div>
 </div>
 
 <script>
 const chartOpts = {
   responsive: true,
   animation: false,
+  spanGaps: false,  // null 지점 끊어서 표시 (혼동 방지)
   plugins: { legend: { labels: { color: '#ccc', font: {size: 11} } } },
   scales: {
     x: { ticks: { color: '#888', maxTicksLimit: 10 }, grid: { color: '#333' } },
@@ -57,7 +60,7 @@ const chartOpts = {
   }
 };
 
-let crashChart, valueChart, rewardChart, entropyChart;
+let crashChart, valueChart, rewardChart, entropyChart, vcvsChart, minGapChart, predChart, axisRewardChart;
 
 function initCharts() {
   crashChart = new Chart(document.getElementById('crashChart'), {
@@ -85,6 +88,12 @@ function initCharts() {
       { label: 'V_crash', data: [], borderColor: '#f44336', borderWidth: 2, pointRadius: 0 },
       { label: 'V_safe', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0 },
     ] }, options: chartOpts
+  });
+  minGapChart = new Chart(document.getElementById('minGapChart'), {
+    type: 'line', data: { labels: [], datasets: [{ label: 'min_gap', data: [], borderColor: '#00e5ff', borderWidth: 2, pointRadius: 0 }] }, options: chartOpts
+  });
+  predChart = new Chart(document.getElementById('predChart'), {
+    type: 'line', data: { labels: [], datasets: [{ label: 'PRED (AUC[5])', data: [], borderColor: '#ce93d8', borderWidth: 2, pointRadius: 0 }] }, options: chartOpts
   });
 }
 
@@ -120,6 +129,17 @@ async function update() {
       vcvsChart.data.datasets[0].data = d.v_crash;
       vcvsChart.data.datasets[1].data = d.v_safe;
       vcvsChart.update();
+    }
+
+    if (d.min_gap) {
+      minGapChart.data.labels = labels;
+      minGapChart.data.datasets[0].data = d.min_gap;
+      minGapChart.update();
+    }
+    if (d.pred) {
+      predChart.data.labels = labels;
+      predChart.data.datasets[0].data = d.pred;
+      predChart.update();
     }
 
     const last = d.steps.length - 1;
@@ -159,7 +179,7 @@ def api_data():
         return jsonify({'steps': [], 'crash_rate': [], 'v_safety': [], 'v_efficiency': [], 'v_mission': [], 'reward': [], 'entropy': [], 'episodes': []})
 
     db = sqlite3.connect(DB_PATH)
-    # 최대 2000개 포인트 (간격 조절)
+    # 최대 2000개 포인트 — rowid 모듈로 stride 샘플링 (전 구간 균등, 최신 포함)
     total = db.execute('SELECT COUNT(*) FROM dreamer_steps').fetchone()[0]
     skip = max(1, total // 2000)
 
@@ -172,9 +192,12 @@ def api_data():
                COALESCE(r_safety, 0) as rs,
                COALESCE(r_efficiency, 0) as re,
                COALESCE(r_mission, 0) as rm,
-               COALESCE(v_crash, 0) as vcr,
-               COALESCE(v_safe, 0) as vsf
+               v_crash as vcr,
+               v_safe as vsf,
+               min_gap as mg,
+               auc_5 as a5
         FROM dreamer_steps
+        WHERE rowid % {skip} = 0
         ORDER BY timestamp
         LIMIT 2000
     ''').fetchall()
@@ -183,10 +206,12 @@ def api_data():
     steps, crash_rate, v_safety, v_efficiency, v_mission = [], [], [], [], []
     r_safety, r_efficiency, r_mission = [], [], []
     v_crash_list, v_safe_list = [], []
+    min_gap_list, pred_list = [], []
     entropy, episodes = [], []
 
     for r in rows:
-        step, mean_r, mean_v, crashes, ent, tot_ep, tot_cr, tot_safe, vs, ve, vm, rs, re, rm, vcr, vsf = r
+        (step, mean_r, mean_v, crashes, ent, tot_ep, tot_cr, tot_safe,
+         vs, ve, vm, rs, re, rm, vcr, vsf, mg, a5) = r
         steps.append(tot_ep)  # X축: episodes
         cr = (tot_cr / max(tot_ep, 1)) * 100
         crash_rate.append(round(cr, 2))
@@ -196,8 +221,10 @@ def api_data():
         r_safety.append(round(rs, 2))
         r_efficiency.append(round(re, 2))
         r_mission.append(round(rm, 2))
-        v_crash_list.append(round(vcr, 2))
-        v_safe_list.append(round(vsf, 2))
+        v_crash_list.append(round(vcr, 2) if vcr is not None else None)
+        v_safe_list.append(round(vsf, 2) if vsf is not None else None)
+        min_gap_list.append(round(mg, 2) if mg is not None else None)
+        pred_list.append(round(a5, 3) if a5 is not None else None)
         entropy.append(round(ent, 2))
         episodes.append(tot_ep)
 
@@ -206,6 +233,7 @@ def api_data():
         'v_safety': v_safety, 'v_efficiency': v_efficiency, 'v_mission': v_mission,
         'r_safety': r_safety, 'r_efficiency': r_efficiency, 'r_mission': r_mission,
         'v_crash': v_crash_list, 'v_safe': v_safe_list,
+        'min_gap': min_gap_list, 'pred': pred_list,
         'entropy': entropy, 'episodes': episodes,
     })
 

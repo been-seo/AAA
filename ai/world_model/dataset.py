@@ -180,12 +180,20 @@ class TrajectoryDataset(Dataset):
     """
 
     def __init__(self, data_dir, past_steps=6, future_steps=12,
-                 max_files=None, stride=2):
+                 max_files=None, stride=2, time_filter=None,
+                 weekday_only=False):
+        """
+        :param time_filter: None 또는 (kst_hour_start, kst_hour_end).
+            예: (8, 16) → 한국시각 08:00 ≤ t < 16:00 만 포함.
+        :param weekday_only: True면 주말(토/일) 제외.
+        """
         self.past_steps = past_steps
         self.future_steps = future_steps
         self.total_steps = past_steps + future_steps
         self.stride = stride
         self.data_dir = Path(data_dir)
+        self.time_filter = time_filter
+        self.weekday_only = weekday_only
 
         # 스레드별 DB 커넥션 (SQLite는 스레드 간 공유 불가)
         self._local = threading.local()
@@ -203,6 +211,37 @@ class TrajectoryDataset(Dataset):
             self._has_world = False
 
         self._build_index(max_files)
+        # 필터 적용 (window start timestamp 기준) — unfiltered positions 저장
+        self._unfiltered_len = len(self.index)
+        self._unfiltered_positions = list(range(self._unfiltered_len))
+        if self.time_filter is not None or self.weekday_only:
+            self._apply_filter()
+
+    def _apply_filter(self):
+        """Window start_ts 기준으로 인덱스 필터링. unfiltered 위치 추적."""
+        h_start, h_end = self.time_filter or (0, 24)
+        new_index = []
+        new_ts = []
+        new_positions = []
+        for pos, (entry, ts) in enumerate(zip(self.index, self._window_ts)):
+            kst_ts = ts + 9 * 3600
+            if self.time_filter is not None:
+                kst_hour = (kst_ts // 3600) % 24
+                if not (h_start <= kst_hour < h_end):
+                    continue
+            if self.weekday_only:
+                kst_wd = ((kst_ts // 86400) + 3) % 7
+                if kst_wd >= 5:
+                    continue
+            new_index.append(entry)
+            new_ts.append(ts)
+            new_positions.append(pos)
+        removed = len(self.index) - len(new_index)
+        print(f"[Dataset] Filter applied: {len(self.index)} → {len(new_index)} "
+              f"samples (removed {removed}, {removed/max(len(self.index),1)*100:.1f}%)")
+        self.index = new_index
+        self._window_ts = new_ts
+        self._unfiltered_positions = new_positions
 
     def _get_conn(self, db_path):
         """스레드별 DB 커넥션 (DataLoader num_workers > 0 대응)."""
@@ -238,14 +277,14 @@ class TrajectoryDataset(Dataset):
             """).fetchall()
             conn.close()
 
-            # 항공기별 그룹화
+            # 항공기별 그룹화 (unfiltered — 필터는 window 레벨에서 적용)
             icao_snaps = {}  # icao → [(sid, ts)]
             for icao, sid, ts in rows:
                 if icao not in icao_snaps:
                     icao_snaps[icao] = []
                 icao_snaps[icao].append((sid, ts))
 
-            # 연속 구간 → 슬라이딩 윈도우 인덱스
+            # 연속 구간 → 슬라이딩 윈도우 인덱스 (start_ts 기록)
             for icao, snap_list in icao_snaps.items():
                 # 연속 구간 분할 (gap > 30초)
                 segments = []
@@ -261,10 +300,16 @@ class TrajectoryDataset(Dataset):
                     segments.append(current_seg)
 
                 for seg in segments:
-                    sids = [s[0] for s in seg]
-                    for start in range(0, len(sids) - self.total_steps + 1, self.stride):
-                        window_sids = sids[start:start + self.total_steps]
+                    for start in range(0, len(seg) - self.total_steps + 1, self.stride):
+                        window = seg[start:start + self.total_steps]
+                        window_sids = [s[0] for s in window]
+                        start_ts = window[0][1]
+                        # 기존 구조 (db_path, icao, window_sids) 유지 +
+                        # start_ts는 _window_ts_list에 병렬 저장 (필터용)
                         self.index.append((db_path, icao, window_sids))
+                        if not hasattr(self, '_window_ts'):
+                            self._window_ts = []
+                        self._window_ts.append(int(start_ts))
 
         print(f"[Dataset] {len(self.index)} samples indexed "
               f"from {len(self._db_paths)} DB files")
@@ -308,8 +353,70 @@ class TrajectoryDataset(Dataset):
         if cache_dir is None:
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
             cache_dir = os.path.normpath(cache_dir)
-        cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}.pt')
+        tf_tag = ''
+        if self.time_filter is not None:
+            tf_tag += f'_kst{self.time_filter[0]:02d}-{self.time_filter[1]:02d}'
+        if self.weekday_only:
+            tf_tag += '_wk'
+        cache_path = os.path.join(cache_dir, 'models', f'preload_p{self.past_steps}_f{self.future_steps}{tf_tag}.pt')
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+        # 필터 캐시가 없고 unfiltered 캐시가 있으면 거기서 선택 추출
+        if tf_tag and not os.path.exists(cache_path):
+            unfiltered_path = os.path.join(
+                cache_dir, 'models',
+                f'preload_p{self.past_steps}_f{self.future_steps}.pt')
+            if os.path.exists(unfiltered_path) and hasattr(self, '_unfiltered_positions'):
+                print(f"[Dataset] Reusing unfiltered cache: {unfiltered_path}")
+                try:
+                    cache = torch.load(unfiltered_path, map_location='cpu',
+                                        weights_only=True)
+                    n_unfiltered_cached = cache['n']
+                    # 필터 통과한 unfiltered 위치 중 캐시 범위 [0, n_unfiltered_cached) 내 위치
+                    valid_pairs = [(i, p) for i, p in enumerate(self._unfiltered_positions)
+                                    if p < n_unfiltered_cached]
+                    if not valid_pairs:
+                        print(f"[Dataset] No cached positions pass filter — falling back to rebuild")
+                    else:
+                        filtered_local, unfiltered_pos = zip(*valid_pairs)
+                        pos_tensor = torch.tensor(unfiltered_pos, dtype=torch.long)
+                        # 캐시에서 해당 위치만 추출
+                        self._cache_past = cache['past'].index_select(0, pos_tensor).contiguous()
+                        self._cache_future = cache['future'].index_select(0, pos_tensor).contiguous()
+                        self._cache_ctx = cache['ctx'].index_select(0, pos_tensor).contiguous()
+                        self._cache_msk = cache['msk'].index_select(0, pos_tensor).contiguous()
+                        self._cache_future_raw = cache['future_raw'].index_select(0, pos_tensor).contiguous()
+                        if self._has_world and 'world' in cache:
+                            self._cache_world = cache['world'].index_select(0, pos_tensor).contiguous()
+                        del cache
+                        # index도 대응하는 subset만 유지
+                        self.index = [self.index[i] for i in filtered_local]
+                        self._window_ts = [self._window_ts[i] for i in filtered_local]
+                        self._unfiltered_positions = [self._unfiltered_positions[i] for i in filtered_local]
+                        self._preloaded = True
+                        mb = sum(t.nbytes for t in [self._cache_past, self._cache_future,
+                                                     self._cache_ctx, self._cache_msk,
+                                                     self._cache_future_raw]) / 1024 / 1024
+                        N_new = len(self.index)
+                        print(f"[Dataset] Reused {N_new} samples from unfiltered cache "
+                              f"({mb:.0f}MB)")
+                        # 새 필터 캐시로 저장 (추후 재사용 빠르게)
+                        try:
+                            save_dict = {
+                                'n': N_new, 'past': self._cache_past,
+                                'future': self._cache_future, 'ctx': self._cache_ctx,
+                                'msk': self._cache_msk, 'future_raw': self._cache_future_raw,
+                            }
+                            if self._has_world:
+                                save_dict['world'] = self._cache_world
+                            torch.save(save_dict, cache_path)
+                            sz = os.path.getsize(cache_path) / 1024 / 1024
+                            print(f"[Dataset] Filtered cache saved: {cache_path} ({sz:.0f}MB)")
+                        except Exception as e:
+                            print(f"[Dataset] Save failed: {e}")
+                        return
+                except Exception as e:
+                    print(f"[Dataset] Reuse failed: {e} — rebuilding from DB")
 
         cached_n = 0
         if os.path.exists(cache_path):

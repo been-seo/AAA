@@ -406,17 +406,34 @@ def main():
     parser.add_argument('--patience', type=int, default=20)
     parser.add_argument('--log-db', type=str, default='models/world_model/train_log.db')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--kst-hours', type=str, default=None,
+                        help='KST 시간 필터 "start-end" 형식. 예: "8-16" → '
+                             '한국시각 08:00~16:00 만 학습.')
+    parser.add_argument('--weekday-only', action='store_true',
+                        help='주말(토/일) 제외, 평일만 학습.')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 데이터셋
+    # 데이터셋 (--kst-hours로 시간대 필터링 가능)
+    time_filter = None
+    if args.kst_hours:
+        try:
+            h_s, h_e = args.kst_hours.split('-')
+            time_filter = (int(h_s), int(h_e))
+            print(f"[Trainer] KST time filter: {time_filter[0]:02d}-{time_filter[1]:02d}")
+        except (ValueError, IndexError):
+            print(f"[Trainer] --kst-hours 형식 오류 '{args.kst_hours}', 무시")
+    if args.weekday_only:
+        print("[Trainer] Weekday-only (주말 제외)")
     dataset = TrajectoryDataset(
         data_dir=args.data_dir,
         past_steps=args.past_steps,
         future_steps=args.future_steps,
         stride=4,
         max_files=args.max_files,
+        time_filter=time_filter,
+        weekday_only=args.weekday_only,
     )
     if len(dataset) == 0:
         return
@@ -476,7 +493,21 @@ def main():
     # Resume
     start_epoch = 1
     best_val_loss = float('inf')
+    best_score = float('inf')  # composite (pos_err + calibration + sharpness)
     patience_counter = 0
+
+    def composite_score(vm):
+        """정확성(pos_err) + 타이트함(sharpness) + cov90 calibration 결합.
+        민항기는 정형 비행이니 tight+accurate 선호, cov90은 0.9 근처만.
+        """
+        pe = vm.get('pos_err_final', 10)
+        cov = vm.get('coverage_90', 0)
+        shrp = vm.get('sharpness_nm', 5)
+        # cov90 deviation from 0.9, heavier penalty if UNDER 0.85
+        cov_dev = abs(cov - 0.9)
+        if cov < 0.85:
+            cov_dev += (0.85 - cov) * 2  # extra penalty for under-coverage
+        return pe + 10.0 * cov_dev + 0.3 * shrp
 
     if args.resume:
         ckpt_path = Path(args.resume)
@@ -519,14 +550,15 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         dt = time.time() - t0
 
-        is_best = val_metrics['loss'] < best_val_loss
+        # 새 best 기준: composite score (정확성 + calibration + tightness)
+        score = composite_score(val_metrics)
+        is_best = score < best_score
         db_log.log_epoch(epoch, train_metrics, val_metrics, lr, dt, is_best)
         cov = val_metrics.get('coverage_90', 0)
         shrp = val_metrics.get('sharpness_nm', 0)
         bounds = val_metrics.get('err_bounds')
         bounds_str = ""
         if bounds:
-            # 최종 스텝(120초)의 상하한
             q10_f = bounds['q10'][-1]
             q50_f = bounds['q50'][-1]
             q90_f = bounds['q90'][-1]
@@ -534,10 +566,12 @@ def main():
         print(f"[Epoch {epoch}/{args.epochs}] loss={train_metrics['loss']:.4f} "
               f"val={val_metrics['loss']:.4f} pos_err={val_metrics.get('pos_err_final',0):.2f}NM "
               f"cov90={cov:.0%} shrp={shrp:.1f}NM {bounds_str}"
-              f"lr={lr:.1e} dt={dt:.0f}s {'*BEST*' if is_best else ''}")
+              f"score={score:.2f} lr={lr:.1e} dt={dt:.0f}s "
+              f"{'*BEST*' if is_best else ''}")
         sys.stdout.flush()
 
         if is_best:
+            best_score = score
             best_val_loss = val_metrics['loss']
             patience_counter = 0
             torch.save({
@@ -546,6 +580,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'val_loss': best_val_loss,
+                'val_score': best_score,
                 'val_metrics': val_metrics,
                 'args': vars(args),
             }, save_dir / 'best_model.pt')

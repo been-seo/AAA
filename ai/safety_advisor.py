@@ -131,16 +131,16 @@ class SafetyAdvisor:
     def _init_world_model(self, model_path):
         """학습된 World Model 로드"""
         try:
-            from ai.world_model.trajectory_predictor import TrajectoryPredictor
+            from ai.world_model.physics_wm import PhysicsWM
             from ai.world_model.conflict_detector import ConflictDetector
 
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
             args = checkpoint.get('args', {})
-            model = TrajectoryPredictor(
+            model = PhysicsWM(
                 hidden_dim=args.get('hidden_dim', 256),
-                latent_dim=args.get('latent_dim', 64),
+                past_steps=args.get('past_steps', 6),
             ).to(device)
             model.load_state_dict(checkpoint['model_state_dict'])
             model.eval()
@@ -295,13 +295,10 @@ class SafetyAdvisor:
             world_feat = world_feat_batch[ui].unsqueeze(0) \
                 if world_feat_batch is not None else None
             with torch.no_grad():
+                # 위험도는 safety head만 사용 (B안: critic = crash detector)
                 overall_risk = self._critic.risk_score(
                     own_norm, traffic_norm, world_feat=world_feat).item()
-                axis = self._critic.axis_scores(
-                    own_norm, traffic_norm, world_feat=world_feat)
-                ai_safety = axis['safety'].item()
-                ai_efficiency = axis['efficiency'].item()
-                ai_mission = axis['mission'].item()
+                ai_safety = overall_risk
 
             callsign = getattr(uac, 'callsign', '') or getattr(uac, 'icao24', '?')
 
@@ -482,11 +479,7 @@ class SafetyAdvisor:
                 detail_parts.append(f"속도:{spd_risk:.0%}")
             ai_detail = " | ".join(detail_parts) if detail_parts else ""
             factors['ai_safety'] = (ai_safety, ai_detail)
-
-            if ai_efficiency >= 0.8:
-                factors['ai_efficiency'] = (ai_efficiency, "")
-            if ai_mission >= 0.8:
-                factors['ai_mission'] = (ai_mission, "")
+            # B안: efficiency/mission은 demo에 표시하지 않음 (critic은 crash만 평가)
 
             max_factor_risk = max(r for r, _ in factors.values())
             if max_factor_risk < 0.30:
@@ -509,7 +502,7 @@ class SafetyAdvisor:
                 label = {
                     'separation': 'SEP', 'convergence': 'CONV',
                     'altitude': 'ALT', 'speed': 'SPD',
-                    'ai_safety': 'AI Safety', 'ai_efficiency': 'AI:E', 'ai_mission': 'AI:M',
+                    'ai_safety': 'AI Safety',
                 }.get(fname, fname)
                 line = f"{label} {frisk:.0%}"
                 if fdetail:
